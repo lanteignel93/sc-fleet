@@ -1,0 +1,6 @@
+# gitleaks: the default rules, unchanged. Site names are leakgate's job
+# (tools/leakgate.py); this catches credentials.
+title = "sc-fleet"
+
+[extend]
+useDefault = true

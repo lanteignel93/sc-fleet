@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+# tk — the task board, from a shell
+#
+#   tk [ls] [-a] [--section S] [--json]   # the board: surfaced tasks, -a all
+#   tk new    <text> [--due D] [--sched D] [--every RULE] [--priority P] [--section S]   # add a task
+#   tk start  <match>   # mark in progress
+#   tk done   <match>   # complete; a recurrence spawns the next
+#   tk cancel <match>   # cancel; ends a recurrence chain
+#   tk defer  <match> <date>   # move its dates
+#   tk move   <match> --to SECTION [--create]   # to another section
+#   tk prune  [--keep-days N] [--dry-run]   # archive closed tasks older than N days
+#   tk doctor   # is the board well-formed
+#   tk path   # where the board lives
+#
+# The engine is tasks.py, which owns the Obsidian Tasks grammar and the
+# recurrence maths. tk is the fleet surface over it and nothing more: every
+# flag is passed through untouched, so anything tk cannot spell the engine
+# still can, and `--line N` keeps working for the ambiguous cases.
+#
+# Verb names follow the fleet spine, so `new` and `doctor` are this tool's
+# names for the engine's `add` and `check`. Both spellings are accepted,
+# because the engine's are already in muscle memory.
+#
+# Bare `tk` lists rather than drawing a splash: it is the thing you type
+# thirty times a day, and art on that path is noise. The splash is on --help.
+set -euo pipefail
+[[ -n "${TK_TRACE:-}" ]] && set -x
+
+# The board lives at <tk.store>/tasks.md; tk.store follows the notes root
+# (~/.config/sc-fleet/config, read by lib/scconf.sh). TK_STORE still wins.
+if ! . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/scconf.sh" 2>/dev/null; then
+  sc_conf() { printf '%s' "${2-}"; }
+fi
+TK_STORE="${TK_STORE:-$(sc_conf tk.store "$(sc_conf notes "$HOME/notes")")}"
+TASKS="$TK_STORE/tasks.md"
+
+# --- output -----------------------------------------------------------------
+SC_TOOL='tk'
+SC_TAGLINE='one queue, one active'
+SC_MOTTO='one file, no second board'
+SC_SIGIL=$'●───\n◆───\n▪───'
+if . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/sckit.sh" 2>/dev/null; then
+  C_DIM="$A_DIM" C_OK="$A_SEA" C_WARN="$A_ERR" C_PATH="$A_LAV" C_MINE="$A_LIME" C_0="$A_0"
+else   # the kit is optional: tk still runs on a box that has only this file
+  sc_mark() { :; }; sc_band() { :; }; sc_splash() { :; }; sc_id() { :; }
+  art_on() { [[ -n "${TK_ART:-}" ]] && return 0; [[ -t 1 && -z "${TK_NO_ART:-}" ]]; }
+  if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    C_DIM=$'\e[2m' C_OK=$'\e[32m' C_WARN=$'\e[31m' C_PATH=$'\e[35m' C_MINE=$'\e[92m' C_0=$'\e[0m'
+  else
+    C_DIM="" C_OK="" C_WARN="" C_PATH="" C_MINE="" C_0=""
+  fi
+  die()  { printf '%srefuse%s    %s\n' "$C_WARN" "$C_0" "$*" >&2; exit 1; }
+  warn() { printf '%swarn%s      %s\n' "$C_WARN" "$C_0" "$*" >&2; }
+fi
+ENGINE="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/tasks.py"
+MANSRC="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../man/tk.1"
+
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required for this"; }
+
+engine() {
+  need python3
+  [[ -f "$ENGINE" ]] || die "engine missing: ${ENGINE/#$HOME/\~}"
+  local verb="$1"; shift
+  python3 "$ENGINE" "$verb" --file "$TASKS" "$@"
+}
+
+# detail — the first non-flag argument, for the band. Flags say how, not what.
+detail() {
+  local a
+  for a in "$@"; do
+    [[ "$a" == -* ]] && continue
+    printf '%.32s' "$a"; return
+  done
+}
+
+# change — run the engine first and band it only if it worked, so the banner
+# never claims something the engine refused.
+change() { # band-verb engine-verb args...
+  local verb="$1" ev="$2"; shift 2
+  local out
+  out="$(engine "$ev" "$@")" || return $?
+  sc_band "$verb" "$(detail "$@")"
+  [[ -n "$out" ]] && printf '%s\n' "$out"
+  art_queue
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# art — the weight grammar, same as the rest of the fleet:
+#   ━ heavy   the board file, which is durable
+#   ─ light   a task, which is not
+#   ▪ queued  ◆ in progress (yours)  ● landed  ◇ deferred (elsewhere in time)
+#
+# The queue strip is drawn from the board, not from a template, so it is data
+# and not decoration. That is why it prints on read-only verbs too, where a
+# band would be wrong.
+# ---------------------------------------------------------------------------
+art_logo() {
+  art_on || return 0
+  printf '\n'; sc_mark; printf '\n'
+  printf '%s\n' "        ${C_MINE}╭─▪──▪${C_0}       ${C_DIM}a section${C_0}"
+  printf '%s\n' "    ${C_DIM}━━●━${C_MINE}┿${C_DIM}━━▪━━●━━${C_OK}▶${C_0}   ${C_DIM}tasks.md${C_0}      tk · one queue, one active"
+  printf '%s\n' "        ${C_MINE}╰─◆${C_0}          ${C_DIM}in progress${C_0}   ${C_DIM}one file, no second board${C_0}"
+  printf '\n'
+}
+
+# art_queue — the open queue as one line, counted off the board itself.
+art_queue() {
+  art_on || return 0
+  [[ -r "$TASKS" ]] || return 0
+  local act tod don cap=14 shown=0 strip="" more="" i
+  act="$(grep -cE '^- \[/\] ' "$TASKS" 2>/dev/null || true)"; act="${act:-0}"
+  tod="$(grep -cE '^- \[ \] ' "$TASKS" 2>/dev/null || true)"; tod="${tod:-0}"
+  don="$(grep -cE '^- \[[xX-]\] ' "$TASKS" 2>/dev/null || true)"; don="${don:-0}"
+  for ((i = 0; i < act && shown < cap; i++)); do strip+="${C_MINE}◆${C_DIM}━"; shown=$((shown+1)); done
+  for ((i = 0; i < tod && shown < cap; i++)); do strip+="${C_0}▪${C_DIM}━"; shown=$((shown+1)); done
+  (( act + tod > cap )) && more="${C_DIM}…━"
+  printf '%s\n' "    ${C_DIM}━━${strip}${more}${C_DIM}━${C_OK}▶${C_0}   ${C_DIM}${act} active · ${tod} queued · ${don} closed${C_0}"
+}
+
+usage() {
+  sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  printf '\n%sman tk%s for the full page · board: %s%s%s\n' \
+    "$C_DIM" "$C_0" "$C_PATH" "${TASKS/#$HOME/\~}" "$C_0"
+}
+
+cmd_help() {
+  if [[ ! -t 1 ]] || [[ ! -f "$MANSRC" ]] || ! command -v man >/dev/null 2>&1; then
+    art_logo
+  fi
+  if [[ -f "$MANSRC" ]] && command -v man >/dev/null 2>&1; then
+    if [[ -t 1 ]]; then man -l "$MANSRC"; else MANWIDTH="${MANWIDTH:-100}" man -P cat -l "$MANSRC"; fi
+  else
+    usage
+  fi
+}
+
+main() {
+  local cmd="${1:-ls}"; shift || true
+  case "$cmd" in
+    ls|list)
+      # -a is the fleet spelling; the engine wants --all
+      local -a a=(); local x
+      for x in "$@"; do [[ "$x" == "-a" ]] && a+=(--all) || a+=("$x"); done
+      engine list ${a[@]+"${a[@]}"}
+      # --json is a machine contract; never decorate it
+      [[ " $* " == *" --json "* ]] || art_queue ;;
+    -a|--all)       engine list --all "$@" ;;
+    new|add)        change new    add    "$@" ;;
+    start)          change start  start  "$@" ;;
+    done)           change done   done   "$@" ;;
+    cancel)         change cancel cancel "$@" ;;
+    defer)          change defer  defer  "$@" ;;
+    move)           change move   move   "$@" ;;
+    prune)
+      # --dry-run changes nothing, so it gets no band
+      if [[ " $* " == *" --dry-run "* ]]; then engine prune "$@"
+      else change prune prune "$@"; fi ;;
+    doctor|check)   engine check "$@" ;;
+    path)           printf '%s\n' "$TASKS" ;;
+    __id)           sc_id ;;
+    -h|--help|help) cmd_help ;;
+    *) die "unknown subcommand $cmd (tk --help)" ;;
+  esac
+}
+
+main "$@"
+
+# sc-fleet — membership marker read by `sc`; identity is set near the top.

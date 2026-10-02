@@ -1,0 +1,23 @@
+#compdef arm
+# zsh completion for arm.
+# Reached through the fpath entry ~/.zsh_functions; fleet.zsh autoloads and
+# compdefs it. Hand-written.
+#
+# The subcommand is declared inline in _arguments rather than through a
+# '->state' dispatch: with only two positionals, the state machinery buys
+# nothing and calling _describe outside a parsed state prints
+# "compdescribe: no parsed state" whenever the cursor sits on an option.
+
+_arm() {
+  _arguments -s \
+    '(- *)'{-a,--all}'[re-arm every shell pane in every tmux session]' \
+    '(- *)'{-s,--session}'[re-arm the panes of this tmux session only]' \
+    {-x,--restart}'[with -a/-s: restart each shell (exec zsh) instead of re-sourcing]' \
+    '(- *)'{-h,--help}'[the manual]' \
+    '1:command:((
+        ls\:what\ would\ be\ re-armed,\ and\ why\ each\ pane\ is\ skipped
+        doctor\:is\ fleet.zsh\ present,\ linked\ and\ sourceable
+      ))'
+}
+
+_arm "$@"

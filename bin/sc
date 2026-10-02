@@ -1,0 +1,309 @@
+#!/usr/bin/env bash
+# sc — the spacecowboy fleet. One namespace over the tools in this directory.
+#
+#   sc                 the menu, under the logo: pick a tool, then its verb
+#                      (fzf, at a terminal); piped or without fzf, the logo,
+#                      the roster and the usage
+#   sc <tool>          that tool's verbs alone, in the menu
+#   sc ls              the roster alone
+#   sc logo            the banner alone, drawn even into a pipe
+#   sc config [KEY]    the effective fleet config, and which file set each
+#                      value (~/.config/sc-fleet/{config,config.local})
+#   sc <tool> [args]   run a fleet tool; identical to calling it directly
+#
+# Membership is not a manifest, which would only drift. A tool is a member when
+# it carries a "# sc-fleet" marker line and answers the hidden __id verb. The
+# marker is checked before anything is executed, so sc never runs a neighbouring
+# script just to ask what it is. Members are looked for in this directory and
+# in SC_BIN_EXTRA (default ~/.local/bin), deduplicated by real path, so a tool
+# that lives in another repo (a theme switcher in a dotfiles repo, say) joins
+# by carrying the marker.
+# The menu is derived the same way: every member declares its verbs in its
+# header block in one grammar, and the menu reads those lines, so a verb is
+# in the menu the moment its header line exists.
+set -euo pipefail
+
+BIN="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+
+SC_TOOL='sc'
+SC_TAGLINE='spacecowboy fleet'
+SC_MOTTO='one palette, one grammar, one man page each'
+SC_SIGIL=$'╭─╮ \n│✦│ \n╰─╯ '
+
+if ! . "$BIN/../lib/sckit.sh" 2>/dev/null || ! . "$BIN/../lib/scconf.sh" 2>/dev/null; then
+  printf 'refuse    sc needs lib/sckit.sh and lib/scconf.sh in its checkout (%s)\n' "$BIN/../lib" >&2
+  exit 1
+fi
+
+is_member() { grep -qm1 '^# sc-fleet' "$1" 2>/dev/null; }
+
+# Every member's path, this directory first, then SC_BIN_EXTRA. A symlink to a
+# tool already seen is the same tool: one entry per real path.
+member_files() {
+  local d f real seen=" "
+  for d in "$BIN" ${SC_BIN_EXTRA-$HOME/.local/bin}; do
+    [[ -d "$d" ]] || continue
+    for f in "$d"/*; do
+      [[ -f "$f" && -x "$f" ]] || continue
+      [[ "${f##*/}" == sc ]] && continue
+      is_member "$f" || continue
+      real="$(readlink -f "$f")"
+      case "$seen" in *" $real "*) continue ;; esac
+      seen+="$real "
+      printf '%s\n' "$f"
+    done
+  done
+}
+member_path() { # NAME -> path, or nothing
+  local f; while IFS= read -r f; do [[ "${f##*/}" == "$1" ]] && { printf '%s' "$f"; return 0; }; done < <(member_files); return 1
+}
+members() {
+  local f
+  while IFS= read -r f; do "$f" __id 2>/dev/null || true; done < <(member_files)
+}
+# roster_lines — name, tagline, middle sigil row; what the menu's first level shows
+roster_lines() {
+  local name tag motto r0 r1 r2
+  while IFS=$'\t' read -r name tag motto r0 r1 r2; do
+    [[ -n "${name:-}" ]] || continue
+    printf '%s\t%s\t%s\n' "$name" "$tag" "${r1:-    }"
+  done < <(members)
+  printf 'sc\t%s\t%s\n' "$SC_TAGLINE" "│✦│ "
+}
+
+cmd_ls() {
+  local name tag motto r0 r1 r2 n=0
+  while IFS=$'\t' read -r name tag motto r0 r1 r2; do
+    [[ -n "${name:-}" ]] || continue
+    n=$((n+1))
+    printf '%s\n' "${SC_M}${A_DIM}${r1:-    }${A_0}   ${A_B}${A_LIME}$(printf '%-7s' "$name")${A_0} ${A_FG}${tag}${A_0}"
+  done < <(members)
+  if [[ "$n" -eq 0 ]]; then
+    printf '%s\n' "${SC_M}${A_DIM}no fleet tools found in ${BIN}${A_0}"
+  fi
+}
+
+usage() {
+  printf '\n%s\n' "${SC_M}${A_DIM}sc <tool> [args]   or call the tool directly; same binary either way${A_0}"
+  printf '%s\n' "${SC_M}${A_DIM}sc <tool>          that tool's verbs, in the menu${A_0}"
+  printf '%s\n' "${SC_M}${A_DIM}sc ls              the roster${A_0}"
+  printf '%s\n' "${SC_M}${A_DIM}sc logo            the banner, for a README${A_0}"
+  printf '%s\n' "${SC_M}${A_DIM}sc config [KEY]    the fleet config and where each value came from${A_0}"
+  printf '%s\n\n' "${SC_M}${A_DIM}sc                 the menu, at a terminal with fzf${A_0}"
+}
+
+# --- config -----------------------------------------------------------------
+# config_src KEY → which file sets KEY (config.local wins), or nothing
+config_src() {
+  local home f; home="$(sc_conf_home)"
+  for f in config.local config; do
+    [[ -n "$(_sc_conf_values "$home/$f" "$1" | tail -n 1)" ]] && { printf '%s' "$f"; return 0; }
+  done
+  return 0
+}
+
+# is_list KEY → true when one file repeats KEY (a list key); a key set once in
+# each file is a scalar that config.local overrides
+is_list() {
+  local home f; home="$(sc_conf_home)"
+  for f in config.local config; do
+    [[ "$(_sc_conf_values "$home/$f" "$1" | wc -l)" -gt 1 ]] && return 0
+  done
+  return 1
+}
+
+cmd_config() {
+  local home key src v
+  home="$(sc_conf_home)"
+  if [[ -n "${1:-}" ]]; then
+    key="$1"; src="$(config_src "$key")"
+    [[ -n "$src" ]] || { printf '%s\t%s\n' "$key" "(unset: the tool's built-in default applies)"; return 0; }
+    if is_list "$key"; then
+      sc_conf_all "$key" | sed "s|^|$key\t|"
+    else
+      printf '%s\t%s\t%s\n' "$key" "$(sc_conf "$key")" "$src"
+    fi
+    return 0
+  fi
+  printf '%s\n' "${A_DIM}${home/#$HOME/\~}${A_0}"
+  [[ -e "$home/config" || -e "$home/config.local" ]] || { printf '%s\n' "${A_DIM}no config: every tool runs on its built-in defaults${A_0}"; return 0; }
+  # every key either file sets, in first-seen order, with its effective value
+  local files=() f
+  for f in "$home/config.local" "$home/config"; do [[ -r "$f" ]] && files+=("$f"); done
+  awk -F= '/^[[:space:]]*(#|$)/ { next } index($0, "=") { k = $1; gsub(/^[[:space:]]+|[[:space:]]+$/, "", k); if (!(k in s)) { s[k] = 1; print k } }' \
+      "${files[@]}" |
+    while IFS= read -r key; do
+      src="$(config_src "$key")"; [[ -n "$src" ]] || continue
+      if is_list "$key"; then v="$(sc_conf_all "$key" | paste -sd '|' - | sed 's/|/  |  /g')"; else v="$(sc_conf "$key")"; fi
+      printf '%-18s %-52s %s\n' "$key" "${v//$HOME/\~}" "${A_DIM}${src}${A_0}"
+    done
+}
+
+# --- the menu ---------------------------------------------------------------
+# Derived, like the roster. Every member's header block declares its verbs in
+# one grammar — "#   rig doctor [--disk]    what is missing here" — and the
+# tool's own usage() prints those same lines. The menu parses them: the
+# command is the verb plus anything that looks like arguments ([...], <...>,
+# -flags), the description is what follows, a trailing "# text" counts as the
+# description too (wt's convention), and a deeper-indented next line continues
+# the entry. TSV out: tool, command, description, needs-args.
+#
+# needs-args is 1 when the command carries a required <placeholder> or a
+# bracketed VALUE word ([-m MSG], [--base BRANCH]): those land on the prompt
+# for editing. Flag-only verbs ([-a], [--disk]) run as picked. The shell
+# function honours it; Tab in the menu forces the prompt for any entry.
+menu_for() { # TOOL FILE
+  awk -v tool="$1" '
+    function take(f) {
+      if (f ~ /^# /) { sub(/^# /, "", f); desc = (desc == "" ? f : desc " " f) }
+      else if (f ~ /^[\[<-]/ && desc == "") cmd = cmd " " f
+      else desc = (desc == "" ? f : desc " " f)
+    }
+    function flush() {
+      if (!active) return
+      needs = (cmd ~ /</ || cmd ~ /\[[^]]*[A-Z][A-Z]+/) ? 1 : 0
+      printf "%s\t%s\t%s\t%d\n", tool, cmd, desc, needs
+      active = 0
+    }
+    NR > 60 { exit }
+    $0 ~ "^#   " tool "( |$)" {
+      flush(); line = $0; sub(/^#   /, "", line)
+      n = split(line, F, /  +/); cmd = F[1]; desc = ""
+      for (i = 2; i <= n; i++) take(F[i])
+      active = 1; next
+    }
+    active && /^# {12,}[^ ]/ {
+      c = $0; sub(/^# +/, "", c); n = split(c, F, /  +/)
+      for (i = 1; i <= n; i++) take(F[i]); next
+    }
+    { flush() }
+    END { flush() }' "$2"
+}
+
+menu_lines() { # [TOOL]
+  local want="${1:-}" f b
+  while IFS= read -r f; do
+    b="${f##*/}"
+    [[ -z "$want" || "$want" == "$b" ]] || continue
+    menu_for "$b" "$f"
+  done < <(member_files)
+  if [[ -z "$want" || "$want" == sc ]]; then
+    printf 'sc\tsc ls\tthe roster\t0\nsc\tsc logo\tthe banner, for a README\t0\n'
+  fi
+}
+
+cmd_usage() { # TOOL — the header block, for the preview pane
+  local t="${1:-sc}" f
+  if [[ "$t" == sc ]]; then f="$BIN/sc"; else f="$(member_path "$t")" || die "no fleet tool named $t (sc ls)"; fi
+  awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$f"
+}
+
+# Exit 2 means "no menu here" (no fzf, or not at a terminal): the shell
+# function then shows the splash instead. Exit 1 is a cancel. On a pick,
+# prints "command<TAB>needs-args"; Tab as the accepting key forces needs-args.
+#
+# Two levels under the logo: the tools, each previewing its verbs; then the
+# chosen tool's verbs. Escape at the second level goes back to the first.
+# The full scene needs 40 rows above a list; below that the wordmark stands
+# in, so the logo is always there and the list always fits.
+# The shell function captures our stdout, so the kit sourced itself with
+# colour off and every logo line was baked plain before the menu could open.
+# The menu draws on the terminal, so when one is there (or colour is forced),
+# source the kit again with colour on: the logo, the sigils and the rows then
+# wear the theme, and fzf renders them with --ansi. NO_COLOR still wins.
+menu_colour_on() {
+  [[ -n "${NO_COLOR:-}" ]] && return 0
+  [[ -t 2 || -n "${SC_COLOR:-}" ]] || return 0
+  SC_COLOR=1 . "$BIN/../lib/sckit.sh"
+}
+
+# The logo the menu sits under: the full scene when the terminal has forty
+# rows, the wordmark under the stars when it does not. The size comes from
+# the controlling terminal, not stdout: stdout is the pipe the shell function
+# reads, and `tput lines` on a pipe answers the terminfo default, 24, forever.
+menu_rows() {
+  local r; r="$( { stty size </dev/tty; } 2>/dev/null | awk '{print $1}')"
+  printf '%s' "${r:-${LINES:-24}}"
+}
+menu_logo_lines() { (( $(menu_rows) >= 40 )) && printf '%s' "$SC_LOGO_LINES" || printf '%s' "$SC_LOGO_SMALL_LINES"; }
+menu_header() {
+  if (( $(menu_rows) >= 40 )); then SC_ART=1 sc_logo; else SC_ART=1 sc_logo_small; fi
+}
+
+cmd_pick() { # [TOOL]
+  local want="${1:-}"
+  command -v fzf >/dev/null 2>&1 || exit 2
+  [[ -t 0 && -t 2 ]] || exit 2
+  menu_colour_on
+  local logo nlogo
+  logo="$(menu_header)"; nlogo="$(menu_logo_lines)"
+  local pv="'$BIN/sc' __usage {1}"
+  local tool sel key line cmd needs n
+  while :; do
+    tool="$want"
+    if [[ -z "$tool" ]]; then
+      n="$(roster_lines | wc -l)"
+      tool="$(roster_lines \
+            | awk -F'\t' -v b="$A_B" -v l="$A_LIME" -v d="$A_DIM" -v z="$A_0" \
+                  '{ printf "%s\t%s%s%s   %s%s%-7s%s %s\n", $1, d, $3, z, b, l, $1, z, $2 }' \
+            | fzf --ansi --delimiter '\t' --with-nth 2 --no-multi --header "$logo" --prompt '› ' \
+                  --preview "$pv" --preview-window 'right,50%,wrap' --layout reverse \
+                  --height "$(( nlogo + n + 6 ))" \
+            | cut -f1)" || exit 1
+      [[ -n "$tool" ]] || exit 1
+    fi
+    n="$(menu_lines "$tool" | wc -l)"
+    sel="$(menu_lines "$tool" \
+          | awk -F'\t' -v d="$A_DIM" -v z="$A_0" '{ printf "%s\t%s\t%s\t%s\t%-38s %s%s%s\n", $1, $2, $3, $4, $2, d, $3, z }' \
+          | fzf --ansi --delimiter '\t' --with-nth 5 --nth 5 --expect=tab --no-multi \
+                --header "$logo" --prompt "$tool › " \
+                --preview "$pv" --preview-window 'right,44%,wrap' --layout reverse \
+                --height "$(( nlogo + n + 7 ))")" || sel=""
+    if [[ -z "$sel" ]]; then
+      [[ -n "$want" ]] && exit 1     # a named tool has no first level to go back to
+      continue
+    fi
+    key="$(sed -n 1p <<<"$sel")"; line="$(sed -n 2p <<<"$sel")"
+    [[ -n "$line" ]] || { [[ -n "$want" ]] && exit 1; continue; }
+    cmd="$(cut -f2 <<<"$line")"; needs="$(cut -f4 <<<"$line")"
+    [[ "$key" == tab ]] && needs=1
+    printf '%s\t%s\n' "$cmd" "$needs"
+    exit 0
+  done
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    ""|-h|--help|help)
+      sc_logo; printf '\n'; cmd_ls; usage ;;
+    ls)
+      cmd_ls ;;
+    logo)
+      SC_ART=1 sc_logo ;;   # asked for by name, so draw it even into a pipe
+    config)
+      cmd_config "${2:-}" ;;
+    __id)
+      sc_id ;;
+    __menu)
+      menu_lines "${2:-}" ;;
+    __roster)
+      roster_lines ;;
+    __header)
+      menu_colour_on; menu_header ;;
+    __usage)
+      cmd_usage "${2:-sc}" ;;
+    __pick)
+      cmd_pick "${2:-}" ;;
+    *)
+      local target
+      if [[ -f "$BIN/$cmd" && -x "$BIN/$cmd" ]] && ! is_member "$BIN/$cmd"; then
+        die "$cmd is not a fleet tool (sc ls)"
+      fi
+      target="$(member_path "$cmd")" || die "no tool named $cmd in the fleet (sc ls)"
+      shift
+      exec "$target" "$@" ;;
+  esac
+}
+
+main "$@"

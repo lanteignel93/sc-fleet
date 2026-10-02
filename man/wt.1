@@ -1,0 +1,539 @@
+.TH WT 1 "2026-10-02" "sc-fleet 0.1.0" "sc-fleet manual"
+.SH NAME
+wt \- one worktree per topic, every checkout a sibling, PRs on any forge
+.SH SYNOPSIS
+.B wt init
+[\fB\-\-migrate\fR] [\fB\-\-mine\fR] [\fB\-y\fR] [\fB\-\-project\fR \fIslug\fR] [\fB\-\-repo\fR \fIname\fR]
+[\fB\-\-clone\fR \fIurl\fR | \fB\-\-new\fR \fIname\fR [\fB\-\-remote\fR \fIurl\fR | \fB\-\-forge\fR forgejo|github \fB\-\-org\fR \fIorg\fR]]
+.br
+.B wt new
+\fIslug\fR [\fB\-\-prefix\fR \fIp\fR] [\fB\-\-track\fR \fIremote-branch\fR] [\fB\-\-from\fR \fIref\fR] [\fB\-\-repo\fR \fIname\fR]
+.br
+.B wt ls
+[\fB\-a\fR] [\fB\-\-pr\fR] [\fB\-\-porcelain\fR]
+.br
+.B wt path
+[\fIquery\fR]
+.br
+.B wt cd
+[\fIquery\fR]   (zsh wrapper)
+.br
+.B wt sync
+.br
+.B wt pr
+[\fB\-t\fR \fItitle\fR] [\fB\-b\fR \fIbody-file\fR] [\fB\-\-base\fR \fIbranch\fR] [\fB\-\-draft\fR] [\fB\-\-no\-squash\fR] [\fB\-\-dry\-run\fR]
+.br
+.B wt rm
+\fIslug\fR [\fB\-\-force\fR]
+.br
+.B wt doctor
+[\fB\-a\fR]
+.br
+.B wt help
+[\fIcommand\fR]
+.SH DESCRIPTION
+.B wt
+runs the branch workflow for several projects, each with several topics in
+flight, on a machine whose local disk need not be durable. Every checkout of a
+repo is a sibling directory: the clone lives at
+.IR src/<repo>/main
+and each topic is a linked git worktree beside it, named by slug. Notes,
+per-repo conventions and topic logs live in a durable store
+.RI ( <store>/<proj>/ ,
+by default
+.IR ~/notes/projects/<proj>/ )
+and are symlinked into the project directory. The same tool is called by a
+human from a shell and by an agent such as Claude Code from a slash command,
+so the procedure is deterministic and lives in one place.
+.SH LAYOUT
+.nf
+<root>/<proj>/                         plain dir \(em never a git repo
+\(bu CLAUDE.md -> <store>/<proj>/CLAUDE.md
+\(bu docs      -> <store>/<proj>/
+\(bu src/<repo>/
+     main/                             the clone; stays on the default branch
+       .claude/settings.local.json     repo-scoped allows (allow_interp=true only)
+     <slug>/                           worktree, branch = <prefix><slug>
+       CLAUDE.local.md -> docs/topics/<slug>.md   (git-excluded)
+
+<store>/<proj>/                        durable store \(em git, pushed
+\(bu CLAUDE.md  README.md
+\(bu repos/<repo>.conf                 per-repo conventions
+\(bu topics/<slug>.md  topics/archive/
+.fi
+.PP
+.I $(git-common-dir)/info/exclude
+carries
+.B CLAUDE.local.md
+and
+.BR .claude/ ,
+so nothing personal is visible to
+.B git status
+in a shared repo. Sibling repos of one project sit beside each other under
+.IR src/ .
+.SH COMMANDS
+.SS wt init
+Bootstrap or retrofit a project. Creates the wrapper and
+.IR src/ ,
+the store with stub
+.B README.md
+and
+.BR CLAUDE.md ,
+both symlinks,
+.I repos/<repo>.conf
+with inferred values (base = upstream when that remote exists; prefix = the
+most common
+.I dir/
+prefix among remote branches whose tip you authored; forge from the base URL
+host), the exclude entries, and
+.B core.hooksPath scripts/hooks
+when the repo ships hooks. Idempotent.
+.TP
+.BI \-\-project " slug"
+Operate on
+.I $WT_ROOT/slug
+instead of the project derived from the current directory.
+.TP
+.BI \-\-clone " url"
+Clone into
+.IR src/<basename>/main .
+With
+.B \-\-project
+this creates the project from nothing; inside an existing wrapper it adds a
+sibling repo.
+.TP
+.BI \-\-new " name"
+.B git init \-b main
+at
+.I src/name/main
+with an empty root commit. Add
+.BI \-\-remote " url"
+to set origin and push, or
+.B \-\-forge forgejo \-\-org
+.I org
+(creates the repo through the Forgejo API; needs the token) or
+.B \-\-forge github \-\-org
+.I org
+(uses
+.BR "gh repo create" ).
+With neither, prints the remote-add line to run once the repo exists.
+.TP
+.B \-\-migrate
+Move an old-layout clone at
+.I src/<repo>
+to
+.IR src/<repo>/main .
+Refuses when the clone is dirty or already has linked worktrees.
+.TP
+.B \-\-mine
+Write interpreter allows
+.RB ( "Bash(python3 *)" ", " "Bash(python *)" ", " "Bash(pytest *)" ", " "Bash(ruff *)" )
+into
+.I main/.claude/settings.local.json
+and set
+.B allow_interp=true
+in the conf. For repos you own; never for someone else's checkout.
+.TP
+.BR \-y ", " \-\-yes
+Reserved for future prompts; accepted and ignored today.
+.SS wt new
+Create a topic. Fetches the base remote, resolves its default branch, creates
+branch
+.I <prefix><slug>
+from
+.I base/<default>
+(never from the local checkout), adds the worktree at
+.IR src/<repo>/<slug> ,
+seeds
+.I docs/topics/<slug>.md
+and links it into the worktree as
+.BR CLAUDE.local.md .
+The last line of output is the worktree path.
+.TP
+.BI \-\-prefix " p"
+Override the conf prefix for this call
+.RB ( "wt new \-\-prefix ll/fix/ widget" " \(-> " ll/fix/widget ).
+.TP
+.BI \-\-track " remote-branch"
+Adopt an existing branch instead of creating one. The slug defaults to the last
+path component.
+.TP
+.BI \-\-from " ref"
+Branch from
+.I ref
+instead of the base default.
+.TP
+.BI \-\-repo " name"
+Pick the repo when the wrapper holds several.
+.PP
+Refuses a slug containing
+.BR / ,
+the default branch name, an existing directory or branch, and a project whose
+.I main
+is missing. Warns when the project root
+cannot hold a second copy of
+.IR main/build* .
+.SS wt ls
+Table of worktrees: PROJECT REPO SLUG BRANCH \(+-BASE DIRTY NOTE [PR].
+\(+-BASE is ahead/behind the repo's
+.IR base/<default> ;
+.B *
+marks uncommitted changes; NOTE says whether a topic note exists.
+.TP
+.BR \-a ", " \-\-all
+Every project under
+.IR $WT_ROOT ,
+not just the current one.
+.TP
+.B \-\-pr
+Ask the forge for the head's PR state
+.RB ( "#6 open" ", " "#57 merged" ).
+Network.
+.TP
+.B \-\-porcelain
+Tab-separated
+.IR "proj repo slug branch path" ,
+no header, no colour, no art.
+.SS wt path, wt cd
+.B wt path
+prints one worktree path: a unique substring match on
+.I proj/repo/slug
+or the branch name, otherwise an
+.BR fzf (1)
+picker when one is available on a terminal. The zsh function
+.B wt cd
+wraps it in a
+.BR cd .
+.SS wt sync
+Inside a topic worktree: fetch the base remote and rebase onto its default
+branch. On conflict it stops, lists the conflicting paths and leaves the rebase
+in progress for
+.B git rebase \-\-continue
+or
+.BR "git rebase \-\-abort" .
+Refuses in
+.I main
+or on the default branch.
+.SS wt pr
+Land a topic: preflight (clean tree, not the default branch), sync, squash to
+one commit unless the conf says
+.B squash=false
+or
+.B \-\-no\-squash
+is given (pre-squash subjects and bodies are carried into the commit body),
+push (plain when fast-forward,
+.B \-\-force\-with\-lease
+when history was rewritten \(em the normal case after a squash), then open the
+PR on the repo's forge and append a Log line to the topic note. An existing
+open PR for the same head is reported, not duplicated.
+.TP
+.BI \-t " title"
+PR and squash-commit title. Default: the HEAD subject.
+.TP
+.BI \-b " body-file"
+PR body. Default: the note's Goal and Acceptance gate plus the commit list.
+.TP
+.BI \-\-base " branch"
+A stacked PR: rebase onto and target
+.I base/branch
+instead of the default branch. The branch must already be on the base remote.
+A branch created with
+.B wt new \-\-from
+records its parent in the topic note and takes it as the default base; a branch
+that contains another pushed topic's commits without such a record is refused
+until
+.B \-\-base
+names the parent, because squashing to the default branch's merge-base would
+fold the parent topic into this PR. Squashing more than one commit requires
+.BR \-t :
+the last commit's subject is not a PR title.
+.TP
+.B \-\-draft
+Draft PR (Forgejo: a
+.B WIP:
+title prefix).
+.TP
+.B \-\-no\-squash
+Keep the commits for this call.
+.TP
+.B \-\-dry\-run
+Report ahead/behind, the squash plan, the forge and the commits; change nothing.
+.SS wt rm
+Remove a topic after its merge. Refuses when the worktree is dirty, has commits
+not on its upstream (or never pushed), or the branch is not merged \(em merged
+means an ancestor of
+.I base/<default>
+.B or
+the forge reports the head's PR merged (a forge squash-merge rewrites the SHA,
+so the ancestor test alone would refuse forever). Then
+.BR "git worktree remove" ,
+.BR "git branch \-D" ,
+.B fetch \-\-prune
+and the note moves to
+.IR topics/archive/ .
+.TP
+.B \-\-force
+Discard dirty or unpushed work and delete an unmerged branch. Never added by
+Claude on its own.
+.SS wt doctor
+Per repo: layout, symlinks, conf, remote HEAD, exclude entries, forge
+credential (token mode 0600 /
+.B gh auth
+/
+.BR glab ),
+free space on
+.I $WT_ROOT
+and stale worktrees.
+.B \-a
+covers every project.
+.SS wt help
+.B wt help
+prints the synopsis;
+.B wt help
+.I command
+opens this page at that command.
+.SH CONFIGURATION
+Site facts come from the fleet config,
+.I ~/.config/sc-fleet/config
+(and a per-machine
+.I config.local
+beside it, which wins), read with grep and never sourced; see
+.BR sc (1)
+.B config
+to show the effective values.
+.TP
+.B notes
+Notes root. Default
+.IR ~/notes .
+.TP
+.B wt.root
+Project root. Default
+.IR ~/wt .
+.TP
+.B wt.store
+Durable store root. Default
+.IR <notes>/projects .
+.TP
+.BI wt.forge= "glob kind"
+Repeatable. Maps a remote host glob to
+.BR github ", " gitlab " or " forgejo ;
+the first match wins, and
+.I config.local
+rules are tried before
+.IR config 's.
+Built in after them: github.com and
+.B github-*
+ssh aliases \(-> github, gitlab.com and
+.B *gitlab*
+\(-> gitlab, codeberg.org \(-> forgejo.
+.TP
+.B wt.forgejo_web
+Forgejo base URL for
+.BR "wt init \-\-new \-\-forge forgejo" .
+Unset by default, and then that command refuses and names this key.
+.TP
+.B wt.token_file
+Forgejo token file. Default
+.IR ~/.config/forgejo/token .
+.TP
+.B wt.templates
+Directory of text overlays. A
+.I store-README.md
+there replaces the built-in store README;
+.BR {{PROJ}} ,
+.B {{WRAP}}
+and
+.B {{STORE}}
+are substituted.
+.PP
+Per repository:
+.I <store>/<proj>/repos/<repo>.conf
+\(em
+.BR key=value ,
+one per line,
+.B #
+comments allowed, parsed with grep and never sourced.
+.TP
+.B prefix
+Prepended to the slug to form the branch, e.g. empty,
+.B t/
+or
+.BR ab/feature/ .
+.TP
+.B base
+Remote that holds the default branch:
+.B origin
+normally,
+.B upstream
+on a fork checkout.
+.TP
+.B push
+Remote topics are pushed to. Default
+.BR origin .
+.TP
+.B squash
+.B true
+(default) squashes in
+.BR "wt pr" ;
+.B false
+keeps the commits.
+.TP
+.B forge
+.BR auto ", " github ", " forgejo " or " gitlab .
+.B auto
+derives the kind from the base URL host through the
+.B wt.forge
+rules above.
+.TP
+.B allow_interp
+.B true
+writes interpreter allows into
+.IR main/.claude/settings.local.json .
+Default
+.BR false .
+.TP
+.B web
+Browser/API base
+.RI ( https://<host> )
+when the remote host is an IP or an ssh alias.
+.SH FORGES
+.TP
+.B GitHub
+.BR gh (1):
+.BR "gh pr create \-\-base <default> \-\-head [fork-owner:]<branch>" ;
+existing PRs via
+.BR "gh pr list \-\-head" .
+.TP
+.B Forgejo
+REST API with
+.BR "Authorization: token <t>" :
+.B GET /api/v1/repos/o/r
+for the default branch,
+.B GET .../pulls?state=open
+filtered on
+.BR head.ref ,
+.B POST .../pulls
+to create. Token from
+.B $FORGEJO_TOKEN
+or
+.I ~/.config/forgejo/token
+(mode 0600; created once in the web UI, Settings \(-> Applications, scope
+.BR write:repository ).
+Without a token
+.B wt pr
+pushes, prints the compare URL and writes the body to
+.IR $XDG_RUNTIME_DIR/wt-pr-body.md .
+.TP
+.B GitLab
+.BR glab (1):
+.BR "glab mr create \-\-target\-branch <default> \-\-source\-branch <branch>" .
+.SH WHAT CLAUDE READS
+From a session started inside a worktree:
+.I ~/.claude/CLAUDE.md
+(user), the wrapper
+.I CLAUDE.md
+(ancestor directories load at launch; symlinks followed), the repo's own
+.I CLAUDE.md
+if any, and
+.I CLAUDE.local.md
+\(-> the topic note. Permissions come from
+.IR main/.claude/settings.local.json ,
+which Claude Code reads at the main checkout's root and applies to every
+worktree; a shared
+.I .claude/settings.json
+in the wrapper would
+.B not
+apply (it loads from the launch cwd only). Auto-memory is one directory per
+repository, shared by main and all worktrees.
+.SH ENVIRONMENT
+.TP
+.B WT_ROOT
+Project root; overrides
+.BR wt.root .
+.TP
+.B WT_STORE
+Durable store root; overrides
+.BR wt.store .
+.TP
+.B WT_TOKEN_FILE
+Forgejo token file; overrides
+.BR wt.token_file .
+.TP
+.B FORGEJO_TOKEN
+Overrides the token file.
+.TP
+.B WT_FORGE_WEB
+Forgejo base URL for
+.BR "wt init \-\-new \-\-forge forgejo" ;
+overrides
+.BR wt.forgejo_web .
+.TP
+.B WT_TRACE
+Non-empty enables
+.B set \-x
+(the debugger recipe).
+.TP
+.BR WT_NO_ART ", " NO_COLOR
+Suppress the banners / the colours. Both are also off whenever stdout is not a
+terminal, so scripts and Claude always get plain output.
+.TP
+.B WT_ART
+Non-empty draws the banners even on a pipe.
+.SH FILES
+.TP
+.I bin/wt
+The tool, in the sc-fleet checkout; linked to
+.I ~/.local/bin/wt
+by
+.BR install.sh .
+.TP
+.I ~/.config/sc-fleet/config
+The fleet config (see CONFIGURATION).
+.TP
+.I tests/test_wt.sh
+Offline suite against a
+.B file://
+origin:
+.BR "bash tests/test_wt.sh" .
+.SH EXIT STATUS
+0 on success; 1 on a refusal or failure, with a
+.B refuse
+line on stderr saying why and what to do.
+.SH EXAMPLES
+Retrofit an existing clone, then run a topic end to end:
+.nf
+.RS
+cd ~/wt/atlas && wt init \-\-migrate
+wt doctor
+wt new b3\-package && wt cd b3\-package
+$EDITOR CLAUDE.local.md          # fill Goal and Acceptance gate
+claude                           # sessions start inside the worktree
+git commit ...                   # work
+wt sync                          # main moved? rebase onto it
+wt pr \-t "B3: package the simulator \(em self\-test"
+cd .. && wt rm b3\-package       # after the merge
+.RE
+.fi
+Create a project from an existing remote, or a brand-new repo of your own:
+.nf
+.RS
+wt init \-\-project borealis \e
+        \-\-clone forgejo@forge.example.org:acme/borealis.git
+wt init \-\-project piste \-\-new piste \-\-mine \-\-forge forgejo \-\-org acme
+.RE
+.fi
+Adopt a live remote branch with the repo's prefix already in its name:
+.nf
+.RS
+cd ~/wt/atlas/src/atlas\-research
+wt new \-\-track ab/feature/queue\-experiments
+.RE
+.fi
+.SH SEE ALSO
+.BR git\-worktree (1),
+.BR gh (1),
+.BR glab (1),
+.BR fzf (1),
+.BR sc (1);
+.I docs/wt-layout.md
+in the sc-fleet repository.

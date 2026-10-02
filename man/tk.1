@@ -1,0 +1,114 @@
+.TH TK 1 "2026-10-02" "sc-fleet 0.1.0" "sc-fleet manual"
+.SH NAME
+tk \- the task board, from a shell
+.SH SYNOPSIS
+.nf
+\fBtk\fR [\fBls\fR] [\fB-a\fR] [\fB--section\fR \fIS\fR] [\fB--json\fR]
+\fBtk new\fR \fItext\fR [\fB--due\fR \fID\fR] [\fB--sched\fR \fID\fR] [\fB--every\fR \fIRULE\fR] [\fB--priority\fR \fIP\fR] [\fB--section\fR \fIS\fR]
+\fBtk start\fR \fImatch\fR
+\fBtk done\fR \fImatch\fR
+\fBtk cancel\fR \fImatch\fR
+\fBtk defer\fR \fImatch\fR \fIdate\fR
+\fBtk move\fR \fImatch\fR \fB--to\fR \fISECTION\fR [\fB--create\fR]
+\fBtk prune\fR [\fB--keep-days\fR \fIN\fR] [\fB--dry-run\fR]
+\fBtk doctor\fR
+\fBtk path\fR
+.fi
+.SH DESCRIPTION
+The board is one Markdown file in the Obsidian Tasks emoji grammar. Until now
+it was reachable two ways: an agent's slash command, which needs an agent
+session, and \fBtasks.py\fR, which does not look or behave like anything else
+in the fleet.
+.PP
+\fBtk\fR is the fleet surface over that engine. It adds the identity, the
+band on state changes and the spine verb names, and it adds nothing else.
+Every flag is handed to the engine untouched, so anything \fBtk\fR cannot
+spell the engine still can, and \fB--line\fR \fIN\fR keeps working when a
+match is ambiguous.
+.SH WHY A WRAPPER AND NOT A REWRITE
+The engine owns the grammar, the recurrence maths and the section routing,
+and it has a test suite. Reimplementing any of that in bash to make it look
+like a fleet tool would trade correctness for cosmetics. The wrapper is
+roughly a hundred lines and holds no task logic at all.
+.SH COMMANDS
+.TP
+\fBls\fR, \fBlist\fR
+Surfaced tasks: open or in progress, and due today, overdue, or past their
+scheduled date. \fB-a\fR shows
+the whole board, section by section, with line numbers for \fB--line\fR.
+This is what bare \fBtk\fR runs.
+.TP
+\fBnew\fR, \fBadd\fR
+Add a task, to \fB## Inbox\fR unless \fB--section\fR names another; choosing
+the section is the caller's job.
+.TP
+\fBstart\fR, \fBdone\fR, \fBcancel\fR, \fBdefer\fR, \fBmove\fR
+State changes, each matched by a substring of the task text. \fBdone\fR
+spawns the next occurrence of a recurring task; \fBcancel\fR ends the chain.
+.TP
+\fBprune\fR
+Archive finished tasks older than \fB--keep-days\fR. \fB--dry-run\fR changes
+nothing and therefore prints no band.
+.TP
+\fBdoctor\fR, \fBcheck\fR
+Validate the file: malformed dates, broken recurrence chains, duplicate
+entries. Read-only.
+.TP
+\fBpath\fR
+Print the board's path, for piping into an editor or a grep.
+.SH VERB NAMES
+\fBnew\fR and \fBdoctor\fR are the fleet spine's names for what the engine
+calls \fBadd\fR and \fBcheck\fR. Both spellings are accepted, because the
+engine's are already in muscle memory and breaking them buys nothing.
+.SH ART
+Bare \fBtk\fR lists rather than drawing a splash, because it is the thing you
+type thirty times a day. The splash is on \fB--help\fR. Only state-changing
+verbs print a band, and the band prints after the engine has succeeded, so it
+never claims something that was refused.
+.SH ENVIRONMENT
+.TP
+\fBTK_STORE\fR
+Directory holding the board; the file is \fItasks.md\fR inside it.
+Overrides the config key \fBtk.store\fR, which defaults to the \fBnotes\fR
+key, which defaults to \fI~/notes\fR (\fI~/.config/sc-fleet/config\fR; see
+\fBsc config\fR).
+.TP
+\fBTK_ART\fR, \fBTK_NO_ART\fR, \fBSC_ART\fR, \fBSC_NO_ART\fR, \fBNO_COLOR\fR
+Art and colour overrides. The most specific setting wins and, at the same
+level, off beats on.
+.TP
+\fBTK_TRACE\fR
+Set to anything for \fBset -x\fR.
+.SH FILES
+.TP
+\fI<store>/tasks.md\fR
+The board.
+.TP
+\fIlib/tasks.py\fR
+The engine, in the sc-fleet checkout. \fBtk\fR refuses if it is absent.
+The grammar it implements is \fIdocs/tasks.md\fR.
+.TP
+\fIlib/sckit.sh\fR
+The fleet kit. Optional: without it \fBtk\fR runs with plain output.
+.SH EXIT STATUS
+0 on success. 1 on a refusal, including an unknown subcommand and a match
+that finds no open task. 2 when a match is ambiguous; \fB--line\fR \fIN\fR
+picks one.
+.SH EXAMPLES
+.nf
+tk                              what is due
+tk -a                           the whole board with line numbers
+tk new "chase the 14 Sep capture hole" --due 2026-09-22 --priority high
+tk start "capture hole"
+tk done  "capture hole"
+tk defer "EOY expense" 2027-02-01
+tk move  "model_eval phase 3" --to Backlog
+tk doctor
+nvim "$(tk path)"
+.fi
+.SH SEE ALSO
+.BR sc (1),
+.BR wt (1),
+.BR rig (1),
+.BR crew (1),
+.BR arm (1)

@@ -1,0 +1,148 @@
+.TH CREW 1 "2026-10-02" "sc-fleet 0.1.0" "sc-fleet manual"
+.SH NAME
+crew \- every Claude session you have running, and what it is doing
+.SH SYNOPSIS
+.nf
+\fBcrew\fR
+\fBcrew\fR \fB-a\fR | \fB--all\fR
+\fBcrew\fR \fB--sample\fR
+\fBcrew\fR \fB--porcelain\fR
+\fBcrew doctor\fR
+.fi
+.SH DESCRIPTION
+Ten sessions across several boxes and no way to see them: which project each
+is in, which have gone quiet, which is burning CPU, which spawned subagents.
+.PP
+\fBtmux list-panes\fR shows a pane running \fBclaude\fR and nothing more,
+because the interesting state is one process further down and in the
+transcript file. \fBcrew\fR assembles it into one roll call.
+.PP
+Everything it reads is read-only, and a session outside tmux still appears:
+discovery starts from the process list, not from tmux, and the pane column
+reads \fB-\fR when there is no pane.
+.SH WHERE THE FACTS COME FROM
+.TP
+.B session
+\fBpgrep -x claude\fR, then the tmux pane whose shell is an ancestor of that
+process. The walk up the parent chain is necessary because \fBclaude\fR is a
+child of the pane's shell, so a pane's own pid never matches directly.
+.TP
+.B project
+\fI/proc/<pid>/cwd\fR.
+.TP
+.B session id
+The transcript filename under \fI~/.claude/projects/<slug>/\fR, where the
+slug is the working directory with every non-alphanumeric run replaced by a
+dash.
+.TP
+.B idle
+The transcript's mtime. Claude appends to it every turn.
+.TP
+.B subagents
+Transcripts under \fI<session>/subagents/\fR modified in the last 30
+minutes.
+.TP
+.B cpu, rss, up
+\fI/proc/<pid>/stat\fR and \fI/proc/<pid>/status\fR, against
+\fI/proc/stat\fR's btime for the uptime.
+.SH STATE, AND ITS ONE HONEST LIMITATION
+State is derived from how long ago the transcript was last appended to:
+.PP
+.RS
+.nf
+active          under 45 seconds
+waiting         under 30 minutes
+quiet           under a day
+stale           older
+no-transcript   the project dir has none
+.fi
+.RE
+.PP
+A transcript is appended per \fIturn\fR, so a session in the middle of a long
+tool call or a long thought looks \fBwaiting\fR when it is working hard.
+\fB--sample\fR resolves it properly by measuring a CPU delta over 0.6
+seconds and relabelling the row \fBbusy\fR. That distinction is not
+cosmetic: the first real run of this tool showed a session at three minutes
+idle that \fB--sample\fR proved was busy.
+.PP
+\fB--sample\fR costs a fraction of a second per box, so it is opt-in rather
+than the default.
+.SH COMMANDS
+.SS crew
+This box. One row per session, newest activity coloured as yours.
+.SS crew -a, crew --all
+Every box in the shared registry, queried read-only over ssh. The probe is
+this same script piped in on stdin to \fBbash -s\fR, so \fBcrew\fR does not
+need to be installed on the far side. Boxes are rendered in registry order,
+and a box that times out or refuses is marked transient rather than
+aborting the run.
+.PP
+With no registry, this degrades to the local roll call and says so. It never
+refuses for missing data.
+.SS crew --sample
+Measure a CPU delta over 0.6 seconds per session and relabel a session that
+is genuinely working as \fBbusy\fR, instead of trusting transcript age.
+Opt-in because it costs a fraction of a second per box.
+.SS crew --porcelain
+Tab-separated, no header, no colour, no art: box, pane, project, full
+session id, state, idle seconds, uptime seconds, cpu seconds, rss MB,
+subagent count. Raw seconds rather than the human form, because the
+consumer can format and cannot un-format.
+.SS crew doctor
+Whether sessions can be seen from here at all: \fI/proc\fR, \fBpgrep\fR, a
+tmux server, the projects directory, and the registry.
+.SH REGISTRY
+\fBcrew -a\fR reads the same roster as \fBrig\fR(1),
+\fI~/.config/rig/boxes.conf\fR, deliberately: one roster, not two. A box
+needs an \fBssh=\fR alias to be contacted; a stanza without one is listed as
+registry-only. The registry is site data and is never part of the tool.
+.SH ENVIRONMENT
+.TP
+.B CREW_PROJECTS
+Where session transcripts live. Default \fI~/.claude/projects\fR.
+.TP
+.B RIG_BOXES
+The registry path, shared with \fBrig\fR(1).
+.TP
+.B CREW_TIMEOUT \fRor\fB RIG_TIMEOUT
+Per-box ssh timeout in seconds. Default 12.
+.TP
+.B CREW_PAR \fRor\fB RIG_PAR
+Concurrent ssh probes. Default 6.
+.TP
+.B RIG_SSH_OPTS
+Appended to every ssh invocation, so a jump host can be added without the
+tool knowing one exists.
+.TP
+.B CREW_ART
+Force the banner even into a pipe.
+.TP
+.B CREW_NO_ART \fRor\fB NO_COLOR
+Suppress art, or colour.
+.SH FILES
+.TP
+.I bin/crew
+The tool, in the sc-fleet checkout, which is also the remote probe.
+.TP
+.I ~/.config/rig/boxes.conf
+The roster. Site data, delivered by symlink, never in the tool's repo.
+.TP
+.I tests/test_crew.sh
+The test suite. Run: \fBbash tests/test_crew.sh\fR
+.SH EXIT STATUS
+0 when the roll call was rendered, including when some boxes were
+unreachable, since unreachability is transient. 1 on a refusal.
+.SH EXAMPLES
+.nf
+.RS
+crew                       # what am I running here
+crew --sample              # and which of them is actually working
+crew -a                    # across every box in the roster
+crew --porcelain | wc -l   # how many sessions am I paying for
+.RE
+.fi
+.SH SEE ALSO
+.BR sc (1),
+.BR rig (1),
+.BR arm (1),
+.BR wt (1)

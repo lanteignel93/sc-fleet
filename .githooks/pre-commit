@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Refuse a commit whose staged content carries a site string. --strict: a
+# clone without the private deny list cannot commit here at all, rather than
+# commit with half a check.
+exec python3 "$(git rev-parse --show-toplevel)/tools/leakgate.py" --staged --strict -q

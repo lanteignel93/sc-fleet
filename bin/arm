@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# arm — every shell carrying today's kit
+#
+#   arm                    re-arm THIS shell (the zsh function; see below)
+#   arm -a, --all          re-arm every shell pane, all tmux sessions
+#   arm -s, --session      re-arm the panes of this tmux session only
+#   arm -x, --restart      with -a/-s: restart each shell (exec zsh) instead of
+#                          re-sourcing; the only sweep that rebuilds everything
+#   arm ls                 what would be re-armed, and why each pane is not
+#   arm doctor             is fleet.zsh present, linked and sourceable
+#
+# A shell keeps the functions and completions it had when it started. Add a
+# fleet tool and every running shell is a day behind: on 2026-09-21 seven of
+# eight panes were missing `wt cd`, some for six days, and the workaround in
+# the history was `exec zsh` seven times in a week.
+#
+# Bare `arm` is a zsh FUNCTION, not this file: a process cannot change its
+# parent shell, the same wall `wt cd` hits. The function re-sources
+# fleet.zsh in place. This binary does the pane sweep, which a child process
+# can do perfectly well.
+#
+# Re-sourcing the rc is not the answer here: an oh-my-zsh rc with a
+# powerlevel10k instant-prompt block is not safe to run twice, and its PATH
+# appends are unguarded. fleet.zsh is the idempotent subset.
+
+set -euo pipefail
+[[ -n "${ARM_TRACE:-}" ]] && set -x
+
+FLEET="${ARM_FLEET:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../shell/fleet.zsh}"
+
+# --- output -----------------------------------------------------------------
+SC_TOOL='arm'
+SC_TAGLINE='every shell carrying the current kit'
+SC_MOTTO='a shell is only as new as its last source'
+SC_SIGIL=$' ─◆ \n─╂─◆\n ─◆ '
+if . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/sckit.sh" 2>/dev/null; then
+  C_DIM="$A_DIM" C_OK="$A_SEA" C_WARN="$A_ERR" C_PATH="$A_LAV" C_MINE="$A_LIME" C_0="$A_0"
+else   # the kit is optional: arm still runs on a box that has only this file
+  sc_mark() { :; }; sc_band() { :; }; sc_splash() { :; }; sc_id() { :; }
+  art_on() { [[ -n "${ARM_ART:-}" ]] && return 0; [[ -t 1 && -z "${ARM_NO_ART:-}" ]]; }
+  if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    C_DIM=$'\e[2m' C_OK=$'\e[32m' C_WARN=$'\e[31m' C_PATH=$'\e[35m' C_MINE=$'\e[92m' C_0=$'\e[0m'
+  else
+    C_DIM="" C_OK="" C_WARN="" C_PATH="" C_MINE="" C_0=""
+  fi
+  row()  { local l="$1" v="${2:-}"; shift 2 || true
+           printf '%s%-9s%s %-42s %s\n' "$C_DIM" "$l" "$C_0" "$v" "${*:-}"; }
+  ok()   { printf '%s%s%s' "$C_OK" "$*" "$C_0"; }
+  bad()  { printf '%s%s%s' "$C_WARN" "$*" "$C_0"; }
+  dim()  { printf '%s%s%s' "$C_DIM" "$*" "$C_0"; }
+  die()  { printf '%srefuse%s    %s\n' "$C_WARN" "$C_0" "$*" >&2; exit 1; }
+  warn() { printf '%swarn%s      %s\n' "$C_WARN" "$C_0" "$*" >&2; }
+fi
+MANSRC="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../man/arm.1"
+
+# The kit's `row` pads its label to 9, which is right for status lines and
+# too narrow for a pane target like RESEARCH:2.4. Pane tables get their own.
+prow() { local l="$1" v="${2:-}"; shift 2 || true
+         printf '%s%-14s%s %-38s %s\n' "$C_DIM" "$l" "$C_0" "$v" "${*:-}"; }
+
+# --- art --------------------------------------------------------------------
+#   ─ light   ephemeral: a shell, a pane
+#   ╂ the trunk a shell hangs off       ◆ yours
+#   → becomes (before into after)
+art_arm() {
+  art_on || return 0
+  local n="$1"
+  printf '\n%s' "$SC_M"
+  printf '%s─╂─%s' "$C_DIM" "$C_0"
+  local i=0
+  while [[ $i -lt $n && $i -lt 7 ]]; do printf '%s◆%s%s─%s' "$C_MINE" "$C_0" "$C_DIM" "$C_0"; i=$((i+1)); done
+  [[ $n -gt 7 ]] && printf '%s…%s' "$C_DIM" "$C_0"
+  printf '  %s%s pane(s) armed%s\n\n' "$C_DIM" "$n" "$C_0"
+}
+
+art_arm_ls() { # would skipped
+  art_on || return 0
+  printf '\n'
+  printf '%s\n' "    ${C_DIM}─╂─${C_0}${C_MINE}◆${C_0}   ${C_DIM}${1} pane(s) would arm · ${2} skipped (editors, Claude, copy mode)${C_0}"
+  printf '\n'
+}
+
+art_arm_doctor() {
+  art_on || return 0
+  printf '\n'
+  printf '%s\n' "    ${C_DIM}●───●───●${C_0}   ${C_DIM}fleet.zsh · link · syntax · this shell · tmux${C_0}"
+  printf '\n'
+}
+
+# --- fleet file -------------------------------------------------------------
+require_fleet() {
+  [[ -r "$FLEET" ]] ||
+    die "no readable fleet.zsh at ${FLEET/#$HOME/\~} — run install.sh in the sc-fleet checkout"
+}
+
+# --- panes ------------------------------------------------------------------
+# One record per pane: id, target, command, in_mode, path.
+# A pane whose current command IS a shell is a pane sitting at a prompt with
+# no foreground job — that is the whole test for "safe to send keys to".
+panes() {
+  tmux list-panes -a -F \
+    '#{pane_id}	#{session_name}:#{window_index}.#{pane_index}	#{pane_current_command}	#{pane_in_mode}	#{pane_current_path}' \
+    2>/dev/null || true
+}
+
+# skip_reason CMD IN_MODE -> "" when the pane is a target, else why not
+skip_reason() {
+  local cmd="$1" mode="$2"
+  case "$cmd" in
+    zsh|bash|-zsh|-bash) ;;
+    *) printf 'running %s' "$cmd"; return ;;
+  esac
+  [[ "$mode" == 0 ]] || { printf 'in copy mode'; return; }
+  printf ''
+}
+
+# Send the re-arm. SOURCE A PATH, never a typed command: zsh autocorrect is on
+# for arguments here, and in any directory containing `src` the bare word `sc`
+# stops at `correct 'sc' to 'src' [nyae]?` and then eats the following
+# keystrokes as its answer. That corrupted two command streams on 2026-09-21.
+# An absolute path to an existing file never trips it.
+send_arm() {
+  local target="$1" cmd="${2:-zsh}"
+  tmux send-keys -l -t "$target" "source $FLEET" 2>/dev/null &&
+  tmux send-keys -t "$target" Enter 2>/dev/null
+}
+
+# Restart mode: exec the pane's own shell in place. Re-sourcing keeps a shell's
+# state but can only refresh what is idempotent; a prompt, a plugin style or a
+# PATH computed at startup needs the shell to start again. `nocorrect` is the
+# zsh precommand modifier that keeps autocorrect off this line (see above).
+send_restart() {
+  local target="$1" cmd="${2:-zsh}"; cmd="${cmd#-}"
+  local line="exec $cmd"; [[ "$cmd" == zsh ]] && line="nocorrect exec zsh"
+  tmux send-keys -l -t "$target" "$line" 2>/dev/null &&
+  tmux send-keys -t "$target" Enter 2>/dev/null
+}
+
+sweep() {
+  local scope="$1" how="${2:-source}"   # all | session ; source | restart
+  [[ -n "${TMUX:-}" ]] || die "not inside tmux — a pane sweep needs it (bare \`arm\` re-arms this shell)"
+  [[ "$how" == restart ]] || require_fleet
+  local this_session=""
+  [[ "$scope" == session ]] && this_session="$(tmux display-message -p '#{session_name}')"
+
+  sc_band "$([[ "$how" == restart ]] && echo 'restart' || echo 're-arm')" "$([[ "$scope" == all ]] && echo 'every session' || echo 'this session')"
+  local armed=0 skipped=0 failed=0
+  local id target cmd mode path reason
+  while IFS=$'\t' read -r id target cmd mode path; do
+    [[ -n "$id" ]] || continue
+    [[ "$scope" == session && "${target%%:*}" != "$this_session" ]] && continue
+    reason="$(skip_reason "$cmd" "$mode")"
+    if [[ -n "$reason" ]]; then
+      prow "$target" "$(dim "$reason")" "$(dim skipped)"
+      skipped=$((skipped+1)); continue
+    fi
+    if { [[ "$how" == restart ]] && send_restart "$id" "$cmd"; } || { [[ "$how" != restart ]] && send_arm "$id" "$cmd"; }; then
+      local note=""
+      [[ "$id" == "${TMUX_PANE:-}" ]] && note="$(dim 'this pane — runs when arm exits')"
+      prow "$target" "${path/#$HOME/\~}" "$(ok "$([[ "$how" == restart ]] && echo restarted || echo armed)") $note"
+      armed=$((armed+1))
+    else
+      warn "$target: send failed"
+      failed=$((failed+1))
+    fi
+  done < <(panes)
+
+  art_arm "$armed"
+  row total "$armed armed · $skipped skipped$([[ $failed -gt 0 ]] && printf ' · %s failed' "$failed")" \
+    "$([[ $failed -eq 0 ]] && ok ok || bad "$failed pane(s) unreachable")"
+  [[ $failed -eq 0 ]]
+}
+
+cmd_ls() {
+  [[ -n "${TMUX:-}" ]] || die "not inside tmux — nothing to list"
+  local id target cmd mode path reason
+  # Count first, so the banner states the outcome rather than preceding it.
+  local nw=0 ns=0
+  while IFS=$'\t' read -r id target cmd mode path; do
+    [[ -n "$id" ]] || continue
+    if [[ -n "$(skip_reason "$cmd" "$mode")" ]]; then ns=$((ns+1)); else nw=$((nw+1)); fi
+  done < <(panes)
+  art_arm_ls "$nw" "$ns"
+  prow PANE "COMMAND" "VERDICT"
+  while IFS=$'\t' read -r id target cmd mode path; do
+    [[ -n "$id" ]] || continue
+    reason="$(skip_reason "$cmd" "$mode")"
+    if [[ -n "$reason" ]]; then
+      prow "$target" "$cmd" "$(dim "skip — $reason")"
+    else
+      prow "$target" "$cmd" "$(ok 'would arm')"
+    fi
+  done < <(panes)
+}
+
+cmd_doctor() {
+  art_arm_doctor
+  local rc=0
+  row fleet "${FLEET/#$HOME/\~}" \
+    "$( [[ -r "$FLEET" ]] && ok ok || { rc=1; bad 'missing — install.sh'; } )"
+  if [[ -L "$FLEET" ]]; then
+    row link "-> $(readlink -f "$FLEET" 2>/dev/null || echo '<broken>')" \
+      "$( [[ -e "$(readlink -f "$FLEET" 2>/dev/null || true)" ]] && ok ok || { rc=1; bad broken; } )"
+  fi
+  if [[ -r "$FLEET" ]] && command -v zsh >/dev/null 2>&1; then
+    row syntax "zsh -n" "$( zsh -n "$FLEET" 2>/dev/null && ok ok || { rc=1; bad 'does not parse'; } )"
+  fi
+  row armed "FLEET_ARMED=${FLEET_ARMED:-unset}" \
+    "$( [[ -n "${FLEET_ARMED:-}" ]] && ok 'this shell has it' || dim 'not visible from here' )"
+  row tmux "$( [[ -n "${TMUX:-}" ]] && echo 'inside tmux' || echo 'no $TMUX' )" \
+    "$( [[ -n "${TMUX:-}" ]] && ok ok || dim 'sweeps need tmux' )"
+  return $rc
+}
+
+usage() {
+  sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  printf '\n%sman arm%s for the full page · art on a tty (ARM_ART=1 forces, ARM_NO_ART=1 hides)\n' \
+    "$C_DIM" "$C_0"
+}
+
+cmd_help() {
+  if [[ ! -t 1 ]] || [[ ! -f "$MANSRC" ]] || ! command -v man >/dev/null 2>&1; then
+    sc_splash
+  fi
+  if [[ -f "$MANSRC" ]] && command -v man >/dev/null 2>&1; then
+    if [[ -t 1 ]]; then man -l "$MANSRC"; else MANWIDTH="${MANWIDTH:-100}" man -P cat -l "$MANSRC"; fi
+  else
+    usage
+  fi
+}
+
+main() {
+  # -x/--restart is a modifier of -a/-s, accepted in either order.
+  local mode=source scope="" a rest=()
+  for a in "$@"; do
+    case "$a" in
+      -x|--restart|--exec) mode=restart ;;
+      -a|--all)            scope=all ;;
+      -s|--session)        scope=session ;;
+      -ax|-xa)             mode=restart; scope=all ;;
+      -sx|-xs)             mode=restart; scope=session ;;
+      *)                   rest+=("$a") ;;
+    esac
+  done
+  if [[ -n "$scope" ]]; then sweep "$scope" "$mode"; return; fi
+  [[ "$mode" == restart ]] && die "-x needs a sweep: arm -a -x or arm -s -x"
+  local cmd="${rest[0]:-}"
+  case "$cmd" in
+    ls)           cmd_ls ;;
+    doctor)       cmd_doctor ;;
+    __id)         sc_id ;;
+    -h|--help)    cmd_help ;;
+    "")
+      # Reached only when the zsh function is absent, so say so plainly
+      # instead of pretending to have done something.
+      sc_splash
+      require_fleet
+      printf '%s\n' "$FLEET"
+      printf '%sbare `arm` needs the zsh function (%s. %s%s, or %sarm -a%s from a shell that has it); meanwhile:%s  source %s\n' \
+        "$C_DIM" "$C_0" "$C_PATH" "${FLEET/#$HOME/\~}" "$C_PATH" "$C_0" "$C_0" "$FLEET"
+      ;;
+    *) die "unknown subcommand $cmd (arm --help)" ;;
+  esac
+}
+
+main "$@"
+
+# sc-fleet — membership marker read by `sc`; identity is set near the top.

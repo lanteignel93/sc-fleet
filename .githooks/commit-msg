@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# A commit message is published too.
+exec python3 "$(git rev-parse --show-toplevel)/tools/leakgate.py" --msg "$1" --strict -q

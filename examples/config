@@ -1,0 +1,37 @@
+# ~/.config/sc-fleet/config, an example with fictional hosts.
+# Grammar: docs/configuration.md. Read with grep, never sourced. Every key is
+# optional; `sc config` shows what is in effect and where it came from.
+
+# Where notes live. wt.store and tk.store follow it unless set themselves.
+notes=~/notes
+
+# --- wt -----------------------------------------------------------------------
+# Projects live under the root; anything that must survive lives in the store.
+wt.root=/data/$USER
+# wt.store=~/notes/projects
+
+# Forge rules, tried before the built-ins (github, gitlab.com, codeberg).
+wt.forge=forge.example.org forgejo
+wt.forge=git.example.org gitlab
+wt.forge=github-* github
+
+# Needed only for `wt init --new --forge forgejo`.
+wt.forgejo_web=https://forge.example.org
+# wt.token_file=~/.config/forgejo/token
+
+# A directory of text overlays (store-README.md); {{PROJ}} {{WRAP}} {{STORE}}.
+# wt.templates=~/.config/sc-fleet/wt
+
+# --- tk -----------------------------------------------------------------------
+# tk.store=~/notes
+# tk.hook_footer=Manage via tk.
+
+# --- rig ----------------------------------------------------------------------
+# The installers rig sequences. Each is your own script; unset means skipped.
+# rig.pull=~/config/bin/pull-all.sh
+# rig.pull_log=~/.local/state/pull-all.log
+# rig.journal=~/config/bin/notes-sync.sh
+# rig.journal_repo=~/notes
+# rig.installer=~/config/install.sh
+# rig.timer_installer=~/config/install-timers.sh
+# rig.cron_installer=~/config/install-cron.sh

@@ -1,0 +1,110 @@
+#compdef tk
+# zsh completion for tk, the fleet's task board.
+# Reached through the fpath entry ~/.zsh_functions, the same way _wt and
+# _crew are. Hand-written; nothing generates it.
+#
+# Candidates are parsed out of the board with grep rather than obtained by
+# running the engine: completion has to stay instant, and the file is the
+# authority anyway. Same reasoning as _crew reading the rig roster.
+
+# The board follows the fleet config, which tk reads; ask it once per shell
+# rather than parse the config twice.
+_tk_board() {
+  [[ -n $TK_STORE ]] && { print -r -- "$TK_STORE/tasks.md"; return }
+  (( ${+_TK_BOARD} )) || typeset -g _TK_BOARD="$(command tk path 2>/dev/null)"
+  print -r -- "$_TK_BOARD"
+}
+
+# Open and in-progress tasks. The value is the task text, because that is what
+# tk matches on; the description is the section it sits in.
+_tk_open() {
+  local f=$(_tk_board)
+  [[ -r $f ]] || { _message "no board at ${f/#$HOME/~}"; return 1 }
+  local -a items
+  items=( ${(f)"$(awk '
+    /^## / { sect = substr($0, 4); next }
+    /^- \[[ \/]\] / {
+      line = $0
+      sub(/^- \[[ \/]\] /, "", line)
+      gsub(/[[:space:]]*[🔺⏫🔼🔽⏬🔁🛫📅✅❌].*$/, "", line)
+      gsub(/:/, " ", line)
+      if (length(line) > 52) line = substr(line, 1, 52)
+      if (line != "") printf "%s:%s\n", line, sect
+    }' "$f" 2>/dev/null)"} )
+  (( $#items )) && _describe -t tasks task items
+}
+
+_tk_sections() {
+  local f=$(_tk_board)
+  local -a s
+  s=( ${(f)"$(grep '^## ' $f 2>/dev/null | sed 's/^## //')"} )
+  (( $#s )) && _describe -t sections section s
+}
+
+_tk() {
+  local curcontext="$curcontext" state line ret=1
+  typeset -A opt_args
+
+  local -a cmds
+  cmds=(
+    'ls:surfaced tasks, or -a for the whole board'
+    'new:add a task'
+    'start:mark a task in progress'
+    'done:complete a task, spawning any recurrence'
+    'cancel:cancel a task, ending a recurrence chain'
+    'defer:push a task to a later date'
+    'move:move a task to another section'
+    'prune:archive finished tasks'
+    'doctor:validate the board'
+    'path:print the board path'
+  )
+
+  _arguments -C \
+    '(-h --help)'{-h,--help}'[man page]' \
+    '(-a --all)'{-a,--all}'[whole board]' \
+    '1: :->cmd' \
+    '*:: :->args' && ret=0
+
+  case $state in
+    cmd) _describe -t commands 'tk command' cmds && ret=0 ;;
+    args)
+      case $words[1] in
+        ls|list)
+          _arguments \
+            '(-a --all)'{-a,--all}'[whole board, with line numbers]' \
+            '--section[one section only]:section:_tk_sections' \
+            '--json[machine-readable]' && ret=0 ;;
+        new|add)
+          _arguments \
+            '--due[due date]:date (YYYY-MM-DD):' \
+            '--sched[scheduled or lead-time date]:date (YYYY-MM-DD):' \
+            '--every[recurrence rule]:rule:(daily weekly "every 2 weeks" monthly quarterly)' \
+            '--priority[priority]:priority:(highest high medium low lowest)' \
+            '--section[section]:section:_tk_sections' \
+            '*:task text:' && ret=0 ;;
+        start|done|cancel)
+          _arguments \
+            '--line[target an exact line number]:line:' \
+            '*:task:_tk_open' && ret=0 ;;
+        defer)
+          _arguments \
+            '--line[target an exact line number]:line:' \
+            '*:task then date:_tk_open' && ret=0 ;;
+        move)
+          _arguments \
+            '--to[destination section]:section:_tk_sections' \
+            '--create[create the section if absent]' \
+            '--line[target an exact line number]:line:' \
+            '*:task:_tk_open' && ret=0 ;;
+        prune)
+          _arguments \
+            '--keep-days[keep finished tasks this many days]:days:' \
+            '--dry-run[change nothing]' \
+            '--no-archive[delete instead of archiving]' && ret=0 ;;
+        *) ret=0 ;;
+      esac ;;
+  esac
+  return ret
+}
+
+_tk "$@"

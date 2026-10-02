@@ -1,0 +1,398 @@
+#!/usr/bin/env bash
+# crew — every Claude you have running, and what it is doing
+#
+#   crew                   this box: one row per session
+#   crew -a, --all         every box in the rig registry, read-only over ssh
+#   crew --sample          add a CPU delta, so "busy" is measured not inferred
+#   crew --porcelain       tab-separated, no header, no colour
+#   crew doctor            can sessions be seen from here at all
+#
+# Ten sessions across several boxes and no way to see them: which project
+# each is in, which have gone quiet, which is burning CPU, which spawned
+# subagents. `tmux list-panes` shows a pane running `claude` and nothing
+# more, because the interesting state is one process down and in the
+# transcript.
+#
+# Where the facts come from, all read-only:
+#   session      pgrep -x claude, then the pane whose shell is its ancestor
+#   project      /proc/<pid>/cwd
+#   id           the transcript filename under ~/.claude/projects/<slug>/
+#   last         transcript mtime — Claude appends on every turn
+#   subagents    transcripts under <session>/subagents/
+#   cpu, rss     /proc/<pid>/stat and status
+#
+# A session NOT in tmux still shows up: discovery starts from the process
+# list, not from tmux, and the pane column reads "-" when there is no pane.
+
+set -euo pipefail
+[[ -n "${CREW_TRACE:-}" ]] && set -x
+
+PROJECTS="${CREW_PROJECTS:-$HOME/.claude/projects}"
+# Shared with rig on purpose: one roster, not two.
+BOXES_DEFAULT="${XDG_CONFIG_HOME:-$HOME/.config}/rig/boxes.conf"
+BOXES="${RIG_BOXES:-$BOXES_DEFAULT}"
+TIMEOUT="${CREW_TIMEOUT:-${RIG_TIMEOUT:-12}}"
+PAR="${CREW_PAR:-${RIG_PAR:-6}}"
+
+# --- output -----------------------------------------------------------------
+SC_TOOL='crew'
+SC_TAGLINE='every Claude you have running'
+SC_MOTTO='ten sessions, one roll call'
+SC_SIGIL=$' ◆  \n━╇━◆\n ◆  '
+if . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/sckit.sh" 2>/dev/null; then
+  C_DIM="$A_DIM" C_OK="$A_SEA" C_WARN="$A_ERR" C_PATH="$A_LAV" C_MINE="$A_LIME" C_0="$A_0"
+else   # the kit is optional: crew still runs on a box that has only this file
+  sc_mark() { :; }; sc_band() { :; }; sc_splash() { :; }; sc_id() { :; }
+  art_on() { [[ -n "${CREW_ART:-}" ]] && return 0; [[ -t 1 && -z "${CREW_NO_ART:-}" ]]; }
+  if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    C_DIM=$'\e[2m' C_OK=$'\e[32m' C_WARN=$'\e[31m' C_PATH=$'\e[35m' C_MINE=$'\e[92m' C_0=$'\e[0m'
+  else
+    C_DIM="" C_OK="" C_WARN="" C_PATH="" C_MINE="" C_0=""
+  fi
+  row()  { local l="$1" v="${2:-}"; shift 2 || true
+           printf '%s%-9s%s %-42s %s\n' "$C_DIM" "$l" "$C_0" "$v" "${*:-}"; }
+  ok()   { printf '%s%s%s' "$C_OK" "$*" "$C_0"; }
+  bad()  { printf '%s%s%s' "$C_WARN" "$*" "$C_0"; }
+  dim()  { printf '%s%s%s' "$C_DIM" "$*" "$C_0"; }
+  die()  { printf '%srefuse%s    %s\n' "$C_WARN" "$C_0" "$*" >&2; exit 1; }
+  warn() { printf '%swarn%s      %s\n' "$C_WARN" "$C_0" "$*" >&2; }
+fi
+MANSRC="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../man/crew.1"
+
+# --- art --------------------------------------------------------------------
+#   ━ heavy   durable: a box
+#   ─ light   ephemeral: a session, which ends
+#   ◆ yours   ◇ elsewhere
+# Counts come from the run, not from a constant: a banner that says the same
+# thing every time is decoration on a command typed many times a day.
+
+art_crew() { # nsessions nboxes
+  art_on || return 0
+  local n="${1:-0}" i out=""
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  [[ "$n" -gt 6 ]] && { out="…─"; n=6; }
+  for ((i=0;i<n;i++)); do out+="◆─"; done
+  out="${out%─}"; [[ -z "$out" ]] && out="·"
+  printf '\n'
+  printf '%s\n' "    ${C_DIM}━━●━┳━${C_0}${C_MINE}${out}${C_0}   ${C_DIM}${1} session(s)$([[ -n "${2:-}" ]] && printf ' across %s box(es)' "$2")${C_0}"
+  printf '\n'
+}
+
+art_crew_doctor() {
+  art_on || return 0
+  printf '\n'
+  printf '%s\n' "    ${C_DIM}●───●───●${C_0}   ${C_DIM}/proc · pgrep · tmux · transcripts · roster${C_0}"
+  printf '\n'
+}
+
+PORC=0 SAMPLE=0
+RUNDIR=""
+ONLY_BOX=""
+
+# --- helpers ----------------------------------------------------------------
+# A cwd becomes its transcript dir the way Claude Code names them: every
+# non-alphanumeric run to a dash, leading dash kept.
+slug_of() { printf '%s' "$1" | sed 's/[^A-Za-z0-9]\+/-/g'; }
+
+ago() {   # seconds -> compact human
+  local s="$1"
+  [[ -z "$s" || "$s" == "-" ]] && { printf '-'; return; }
+  if   [[ $s -lt 60    ]]; then printf '%ds' "$s"
+  elif [[ $s -lt 3600  ]]; then printf '%dm' $((s/60))
+  elif [[ $s -lt 86400 ]]; then printf '%dh%dm' $((s/3600)) $(((s%3600)/60))
+  else printf '%dd%dh' $((s/86400)) $(((s%86400)/3600)); fi
+}
+
+# The tmux pane whose shell is this process's ancestor. Walks up the ppid
+# chain because `claude` is a child of the pane's shell, not the pane itself.
+pane_of() {
+  local pid="$1" hops=0 ppid
+  [[ -n "${CREW_PANEMAP:-}" ]] || return 0
+  while [[ -n "$pid" && "$pid" != 1 && $hops -lt 12 ]]; do
+    local hit
+    hit="$(awk -v p="$pid" -F'\t' '$1==p{print $2; exit}' <<<"$CREW_PANEMAP")"
+    [[ -n "$hit" ]] && { printf '%s' "$hit"; return; }
+    ppid="$(awk '{print $4}' "/proc/$pid/stat" 2>/dev/null || true)"
+    pid="$ppid"; hops=$((hops+1))
+  done
+}
+
+cpu_ticks() {  # utime+stime in ticks
+  local st; st="$(cat "/proc/$1/stat" 2>/dev/null)" || return 1
+  # fields 14,15 after the (possibly parenthesised, space-containing) comm
+  local rest="${st#*) }"
+  awk '{print $12+$13}' <<<"$rest"
+}
+
+# --- the local roll call ----------------------------------------------------
+# Emits one tab-separated record per session:
+#   pane project id state idle uptime cpu rss subagents
+collect_local() {
+  local hz; hz="$(getconf CLK_TCK 2>/dev/null || echo 100)"
+  local now; now="$(date +%s)"
+  local panemap=""
+  if command -v tmux >/dev/null 2>&1 && tmux list-panes -a >/dev/null 2>&1; then
+    panemap="$(tmux list-panes -a -F '#{pane_pid}	#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || true)"
+  fi
+  export CREW_PANEMAP="$panemap"
+
+  # A SESSION is a `claude` whose working directory is readable. Anything
+  # else named `claude` is a child process the harness spawned: on one box 18
+  # of 20 had an unreadable cwd and several shared a single non-shell parent.
+  # Counting those as sessions turned 2 real sessions into 20 rows of noise,
+  # so they are tallied separately instead of dropped — 5 GB of resident
+  # memory is worth reporting, just not as a session.
+  local pid nonsession=0 nonrss=0
+  for pid in $(pgrep -x claude 2>/dev/null || true); do
+    [[ -d "/proc/$pid" ]] || continue
+    local cwd pane slug dir tr id last idle up cpu rss subs state
+    cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null || echo '?')"
+    if [[ "$cwd" == '?' || ! -d "$cwd" ]]; then
+      nonsession=$((nonsession+1))
+      nonrss=$(( nonrss + $(awk '/^VmRSS/{print int($2/1024)}' "/proc/$pid/status" 2>/dev/null || echo 0) ))
+      continue
+    fi
+    pane="$(pane_of "$pid")"; pane="${pane:--}"
+
+    # Uptime from the process start time against the boot clock.
+    # comm can contain spaces and parens, so strip through the last ") "
+    # first; starttime is field 22 overall, so field 20 of what remains.
+    local starttick btime st
+    st="$(cat "/proc/$pid/stat" 2>/dev/null || true)"
+    starttick="$(awk '{print $20}' <<<"${st##*') '}")"
+    btime="$(awk '/^btime/{print $2}' /proc/stat 2>/dev/null || echo 0)"
+    if [[ -n "${starttick:-}" && "$btime" != 0 ]]; then
+      up=$(( now - ( btime + starttick / hz ) ))
+    else
+      up="-"
+    fi
+
+    cpu="$(cpu_ticks "$pid" 2>/dev/null || echo 0)"; cpu=$(( cpu / hz ))
+    rss="$(awk '/^VmRSS/{print int($2/1024)}' "/proc/$pid/status" 2>/dev/null || echo 0)"
+
+    # transcript: newest .jsonl in the project's dir
+    slug="$(slug_of "$cwd")"; dir="$PROJECTS/$slug"
+    tr=""; id="-"; last="-"; subs=0
+    if [[ -d "$dir" ]]; then
+      tr="$(find "$dir" -maxdepth 1 -name '*.jsonl' -printf '%T@\t%p\n' 2>/dev/null | sort -rn | head -1 | cut -f2)"
+      if [[ -n "$tr" ]]; then
+        id="$(basename "$tr" .jsonl)"
+        last="$(stat -c %Y "$tr" 2>/dev/null || echo 0)"
+        idle=$(( now - last ))
+        local sdir="${tr%.jsonl}/subagents"
+        [[ -d "$sdir" ]] && subs="$(find "$sdir" -name '*.jsonl' -newermt '-30 minutes' 2>/dev/null | wc -l)"
+      fi
+    fi
+    [[ -z "${idle:-}" ]] && idle="-"
+
+    # State from idle age. Deliberately conservative wording: a transcript
+    # is appended per turn, so a long tool call looks idle. --sample is the
+    # honest answer when it matters.
+    if   [[ "$idle" == "-" ]];   then state="no-transcript"
+    elif [[ $idle -lt 45    ]];  then state="active"
+    elif [[ $idle -lt 1800  ]];  then state="waiting"
+    elif [[ $idle -lt 86400 ]];  then state="quiet"
+    else state="stale"; fi
+
+    if [[ $SAMPLE -eq 1 ]]; then
+      local c0 c1; c0="$(cpu_ticks "$pid" || echo 0)"; sleep 0.6
+      c1="$(cpu_ticks "$pid" || echo "$c0")"
+      [[ $(( c1 - c0 )) -gt 3 ]] && state="busy"
+    fi
+
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$pane" "$cwd" "$id" "$state" "$idle" "$up" "$cpu" "$rss" "$subs"
+    unset idle
+  done
+  [[ $nonsession -gt 0 ]] &&
+    printf '#children\t%s\t%s\n' "$nonsession" "$nonrss"
+  return 0
+}
+
+render() {   # BOX < records
+  local box="$1" n=0
+  local pane cwd id state idle up cpu rss subs
+  while IFS=$'\t' read -r pane cwd id state idle up cpu rss subs; do
+    [[ -n "$pane" ]] || continue
+    if [[ "$pane" == '#children' ]]; then
+      [[ $PORC -eq 1 ]] && printf '%s\tchildren\t%s\t%s\n' "$box" "$cwd" "$id" ||
+        printf '%s%-13s%s %s\n' "$C_DIM" "" "$C_0" \
+          "$(dim "+ $cwd child process(es) of a harness, not sessions · ${id} MB resident")"
+      continue
+    fi
+    n=$((n+1))
+    if [[ $PORC -eq 1 ]]; then
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$box" "$pane" "$cwd" "$id" "$state" "$idle" "$up" "$cpu" "$rss" "$subs"
+      continue
+    fi
+    local colour="$C_DIM"
+    case "$state" in
+      active|busy) colour="$C_MINE" ;;
+      waiting)     colour="$C_OK" ;;
+      stale)       colour="$C_WARN" ;;
+    esac
+    printf '%s%-13s%s %-11s %s%-9s%s %-7s %-7s %5s %6s %4s  %s%s%s\n' \
+      "$C_DIM" "$pane" "$C_0" "${id:0:8}" \
+      "$colour" "$state" "$C_0" \
+      "$(ago "$idle")" "$(ago "$up")" "${cpu}s" "${rss}M" \
+      "$([[ "$subs" == 0 ]] && printf -- '-' || printf '%s' "$subs")" \
+      "$C_PATH" "${cwd/#$HOME/\~}" "$C_0"
+  done
+  printf '%s' "$n" > "${CREW_COUNT_FILE:-/dev/null}"
+}
+
+header() {
+  [[ $PORC -eq 1 ]] && return 0
+  printf '%s%-13s %-11s %-9s %-7s %-7s %5s %6s %4s  %s%s\n' \
+    "$C_DIM" PANE SESSION STATE IDLE UP CPU RSS SUB PROJECT "$C_0"
+}
+
+# --- the fleet roll call ----------------------------------------------------
+roster() {   # box names from the shared rig registry
+  [[ -r "$BOXES" ]] || return 1
+  grep -h '^box=' "$BOXES" 2>/dev/null | cut -d= -f2- | grep -vx '@defaults' || true
+}
+ssh_for() { awk -v b="$1" '
+  /^box=/ { cur=substr($0,5) }
+  cur==b && /^ssh=/ { print substr($0,5); exit }' "$BOXES" 2>/dev/null; }
+
+fleet() {
+  local boxes; boxes="$(roster)" || {
+    # No roster. Degrade to this box rather than refuse — but never pretend
+    # a --box request was honoured.
+    [[ -n "$ONLY_BOX" ]] &&
+      die "--box $ONLY_BOX needs a roster; none at ${BOXES/#$HOME/\~} (rig boxes creates it)"
+    row registry "${BOXES/#$HOME/\~}" "$(dim 'absent — this box only')"
+    header; collect_local | render "$(hostname -s)"; return 0
+  }
+  # Script scope, not local: the EXIT trap fires after this function has
+  # returned, and under `set -u` a local gone out of scope made the trap
+  # itself fail and turned every fan-out into exit 1.
+  RUNDIR="${RIG_RUN:-${XDG_RUNTIME_DIR:-/tmp}/rig-$(id -u)}/crew.$$"
+  local run="$RUNDIR"
+  mkdir -p "$run"; trap 'rm -rf "${RUNDIR:-}"' EXIT
+  local self; self="$(hostname -s)"
+  local me="$(readlink -f "${BASH_SOURCE[0]}")"
+  local jobs=0 box alias
+  while read -r box; do
+    [[ -n "$box" ]] || continue
+    [[ -n "$ONLY_BOX" && "$box" != "$ONLY_BOX" ]] && continue
+    if [[ "$box" == "$self" ]]; then collect_local > "$run/$box.out"; printf 0 > "$run/$box.rc"; continue; fi
+    alias="$(ssh_for "$box")"
+    [[ -n "$alias" ]] || { printf 'registry-only\n' > "$run/$box.skip"; continue; }
+    (
+      timeout -k 2 "$TIMEOUT" ssh -o BatchMode=yes -o ConnectTimeout=4 \
+        -o ControlPath=none -o LogLevel=ERROR ${RIG_SSH_OPTS:-} "$alias" \
+        /bin/bash -s -- --porcelain-local < "$me" > "$run/$box.out" 2> "$run/$box.err"
+      printf '%s' "$?" > "$run/$box.rc"
+    ) &
+    jobs=$((jobs+1))
+    # A probe that fails is data, not a run failure — swallow its status.
+    [[ $jobs -ge $PAR ]] && { wait -n 2>/dev/null || true; jobs=$((jobs-1)); }
+  done <<<"$boxes"
+  wait 2>/dev/null || true
+
+  if [[ -n "$ONLY_BOX" ]] && ! grep -qx -- "$ONLY_BOX" <<<"$boxes"; then
+    die "no box named $ONLY_BOX in ${BOXES/#$HOME/\~} (crew doctor counts the roster)"
+  fi
+  local nb; nb="$(wc -l <<<"$boxes" | tr -d ' ')"
+  # Two traps here, both hit for real. `grep -c` exits 1 on a zero count, so
+  # a `|| echo 0` fallback appends a SECOND zero and the arithmetic chokes;
+  # count with wc. And under `pipefail` a `cat` over a glob that matches
+  # nothing fails the whole pipeline, which `set -e` turns into an exit —
+  # that happens whenever every box in the roster is registry-only.
+  local nsess=0
+  if compgen -G "$run/*.out" >/dev/null 2>&1; then
+    nsess="$(grep -hv '^#children' "$run"/*.out 2>/dev/null | wc -l | tr -d ' ')"
+  fi
+  art_crew "${nsess:-0}" "$nb"
+  header
+  local total=0 rc
+  while read -r box; do
+    [[ -n "$box" ]] || continue
+    [[ -n "$ONLY_BOX" && "$box" != "$ONLY_BOX" ]] && continue
+    if [[ -f "$run/$box.skip" ]]; then
+      [[ $PORC -eq 1 ]] || row "$box" "$(dim 'no ssh alias')" "$(dim 'registry-only')"
+      continue
+    fi
+    rc="$(cat "$run/$box.rc" 2>/dev/null || echo 255)"
+    if [[ "$rc" != 0 ]]; then
+      local why; case "$rc" in
+        124) why='timeout' ;;
+        255) why="unreachable — $(head -1 "$run/$box.err" 2>/dev/null | cut -c1-48)" ;;
+        *)   why="probe rc=$rc" ;;
+      esac
+      [[ $PORC -eq 1 ]] || row "$box" "$(dim "$why")" "$(dim transient)"
+      continue
+    fi
+    local n; n="$(wc -l < "$run/$box.out" 2>/dev/null || echo 0)"
+    total=$((total+${n:-0}))
+    if [[ $n -eq 0 ]]; then
+      [[ $PORC -eq 1 ]] || row "$box" "$(dim 'no sessions')" "$(ok idle)"
+    else
+      [[ $PORC -eq 1 ]] || printf '%s%s%s\n' "$C_DIM" "── $box" "$C_0"
+      render "$box" < "$run/$box.out"
+    fi
+  done <<<"$boxes"
+  [[ $PORC -eq 1 ]] || { printf '\n'; row total "$total session(s)" "$(ok ok)"; }
+  # Transient per-box failures are reported, not propagated (see EXIT STATUS).
+  return 0
+}
+
+cmd_doctor() {
+  art_crew_doctor
+  row proc "/proc readable" "$( [[ -r /proc/self/stat ]] && ok ok || bad 'no /proc — crew needs it' )"
+  row pgrep "$(command -v pgrep >/dev/null 2>&1 && echo present || echo missing)" \
+    "$( command -v pgrep >/dev/null 2>&1 && ok ok || bad 'install procps' )"
+  row tmux "$( tmux list-panes -a >/dev/null 2>&1 && echo 'server up' || echo 'no server' )" \
+    "$( tmux list-panes -a >/dev/null 2>&1 && ok ok || dim 'pane column will read -' )"
+  row projects "${PROJECTS/#$HOME/\~}" \
+    "$( [[ -d "$PROJECTS" ]] && ok "$(find "$PROJECTS" -maxdepth 1 -type d 2>/dev/null | wc -l) dirs" \
+        || bad 'absent — no session ids or idle times' )"
+  row registry "${BOXES/#$HOME/\~}" \
+    "$( [[ -r "$BOXES" ]] && ok "$(roster | wc -l) box(es)" || dim 'absent — crew -a is local only' )"
+  row sessions "$(pgrep -xc claude 2>/dev/null || echo 0) running here" "$(ok ok)"
+}
+
+usage() {
+  sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  printf '\n%sman crew%s for the full page · art on a tty (CREW_ART=1 forces, CREW_NO_ART=1 hides)\n' \
+    "$C_DIM" "$C_0"
+}
+
+main() {
+  local FLEET=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -a|--all)    FLEET=1 ;;
+      --box)       FLEET=1; ONLY_BOX="${2:-}"
+                   [[ -n "$ONLY_BOX" ]] || die "--box needs a name (crew doctor lists the roster)"
+                   shift ;;
+      --sample)    SAMPLE=1 ;;
+      --porcelain) PORC=1 ;;
+      # hidden: what the ssh probe invokes on the far side
+      --porcelain-local) collect_local; return 0 ;;
+      doctor)      cmd_doctor; return 0 ;;
+      __id)        sc_id; return 0 ;;
+      -h|--help)   if [[ -f "$MANSRC" ]] && command -v man >/dev/null 2>&1 && [[ -t 1 ]]; then
+                     man -l "$MANSRC"; else usage; fi; return 0 ;;
+      *) die "unknown option $1 (crew --help)" ;;
+    esac
+    shift
+  done
+  if [[ $FLEET -eq 1 ]]; then
+    fleet
+  else
+    collect_local > /tmp/.crew.$$
+    local n; n="$(grep -v '^#children' /tmp/.crew.$$ | wc -l | tr -d ' ')"
+    art_crew "$n"
+    header
+    render "$(hostname -s)" < /tmp/.crew.$$; rm -f /tmp/.crew.$$
+    [[ $PORC -eq 1 ]] || { printf '\n'; row total "$n session(s) on $(hostname -s)" "$(ok ok)"; }
+  fi
+}
+
+main "$@"
+
+# sc-fleet — membership marker read by `sc`; identity is set near the top.

@@ -1,0 +1,1145 @@
+#!/usr/bin/env bash
+# wt — one worktree per topic, every checkout a sibling, PRs on any forge.
+#
+#   wt init   [--migrate] [--mine] [-y] [--project P] [--clone URL]
+#             [--new NAME [--remote URL | --forge forgejo|github --org O]]   # a project store: migrate, clone or create
+#   wt new    <slug> [--prefix P] [--track REMOTE_BRANCH] [--from REF]   # a topic worktree on its own branch
+#   wt ls     [-a] [--pr] [--porcelain]   # every topic here, with PR state on --pr
+#   wt path   [query]              # for the zsh wrapper: cd "$(wt path q)"
+#   wt sync                        # rebase this topic onto base/default
+#   wt pr     [-t title] [-b body-file] [--base BRANCH] [--draft] [--no-squash] [--dry-run]
+#                                # push and open (or update) the PR on the forge
+#   wt rm     <slug> [--force]   # remove the worktree, asking the forge whether it merged
+#   wt doctor [-a]   # is this store healthy; -a every store
+#
+# Layout (docs/wt-layout.md):
+#   $WT_ROOT/<proj>/src/<repo>/main        the clone, stays on the default branch
+#   $WT_ROOT/<proj>/src/<repo>/<slug>      linked worktree, branch = <prefix><slug>
+#   $WT_STORE/<proj>/repos/<repo>.conf     per-repo conventions (durable, git)
+#   $WT_STORE/<proj>/topics/<slug>.md      topic note, linked as CLAUDE.local.md
+#
+# Every git operation an agent's topic command needs lives here, so the command
+# stays prose-free and the same thing runs from a plain shell.
+set -euo pipefail
+[[ -n "${WT_TRACE:-}" ]] && set -x
+
+# Site facts (the worktree root, the notes store, forge hosts, the forge web
+# URL, the store templates) come from config, never from this file:
+# lib/scconf.sh reads ~/.config/sc-fleet/config. An env var still wins; with
+# neither, the neutral default applies. Without the lib, sc_conf answers with
+# the default, so wt still runs from a bare copy.
+if ! . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/scconf.sh" 2>/dev/null; then
+  sc_conf() { printf '%s' "${2-}"; }
+  sc_conf_all() { :; }
+  sc_conf_home() { printf '%s' "${SC_CONFIG_HOME:-${XDG_CONFIG_HOME:-$HOME/.config}/sc-fleet}"; }
+fi
+WT_NOTES="$(sc_conf notes "$HOME/notes")"
+WT_ROOT="${WT_ROOT:-$(sc_conf wt.root "$HOME/wt")}"
+WT_STORE="${WT_STORE:-$(sc_conf wt.store "$WT_NOTES/projects")}"
+WT_TOKEN_FILE="${WT_TOKEN_FILE:-$(sc_conf wt.token_file "$HOME/.config/forgejo/token")}"
+WT_TEMPLATES="$(sc_conf wt.templates "$(sc_conf_home)/wt")"
+
+# ---------------------------------------------------------------------------
+# output
+# ---------------------------------------------------------------------------
+SC_TOOL='wt'
+SC_TAGLINE='one worktree per topic'
+SC_MOTTO='every checkout a sibling'
+SC_SIGIL=$' \u256d\u25c6 \n\u2501\u2520\u2500\u25c6\n \u2570\u25c6 '
+if . "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/sckit.sh" 2>/dev/null; then
+  C_DIM="$A_DIM" C_OK="$A_SEA" C_WARN="$A_ERR" C_PATH="$A_LAV" C_ART="$A_SEA" C_0="$A_0"
+  C_MINE="$A_LIME"
+else   # the kit is optional: wt still runs on a box that has only this file
+  sc_mark() { :; }; sc_band() { :; }; sc_id() { :; }
+  art_on() { [[ -n "${WT_ART:-}" ]] && return 0; [[ -t 1 && -z "${WT_NO_ART:-}" ]]; }
+  if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    C_DIM=$'\e[2m' C_OK=$'\e[32m' C_WARN=$'\e[31m' C_PATH=$'\e[35m' C_ART=$'\e[38;5;79m' C_0=$'\e[0m'
+    C_MINE=$'\e[92m'
+  else
+    C_DIM="" C_OK="" C_WARN="" C_PATH="" C_ART="" C_0="" C_MINE=""
+  fi
+fi
+MANSRC="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../man/wt.1"
+
+# row LABEL VALUE [NOTE...] — the two-column status line every subcommand prints
+row()  { local l="$1" v="${2:-}"; shift 2 || true; printf '%s%-9s%s %-42s %s\n' "$C_DIM" "$l" "$C_0" "$v" "${*:-}"; }
+ok()   { printf '%s%s%s' "$C_OK" "$*" "$C_0"; }
+bad()  { printf '%s%s%s' "$C_WARN" "$*" "$C_0"; }
+dim()  { printf '%s%s%s' "$C_DIM" "$*" "$C_0"; }
+die()  { printf '%srefuse%s    %s\n' "$C_WARN" "$C_0" "$*" >&2; exit 1; }
+warn() { printf '%swarn%s      %s\n' "$C_WARN" "$C_0" "$*" >&2; }
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required for this"; }
+
+# ---------------------------------------------------------------------------
+# art — commit-graph glyphs, drawn only for a human: never on a pipe, never
+# in --porcelain output, off with WT_NO_ART. Scripts and Claude get plain rows.
+# ---------------------------------------------------------------------------
+# The grammar (practices, and the fleet kit's palette):
+#   ━ heavy   durable: main, the clone, the store
+#   ─ light   ephemeral: a topic, a worktree, scratch
+#   ╌ dashed  gone: pruned, deleted
+#   ● landed  ◆ yours  ◇ elsewhere (a PR, a remote)
+#   → becomes (before into after)      ▶ destination (a base, a forge, a target)
+# Mixed-weight junctions carry the weight change: ┷ a topic leaves the trunk
+# upward, ┯ downward, ┿ topics both sides with the trunk running through.
+chain() { local n="$1" out=""; [[ "$n" -gt 7 ]] && { n=7; out="…─"; }; local i; for ((i=0;i<n;i++)); do out+="◆──"; done; printf '%s' "${out%──}"; }
+
+art_logo() {
+  art_on || return 0
+  printf '\n'; sc_mark; printf '\n'
+  printf '%s\n' "        ${C_MINE}╭─◆──◆${C_0}       ${C_DIM}topic${C_0}"
+  printf '%s\n' "    ${C_DIM}━━●━${C_MINE}┿${C_DIM}━●━━●━${C_OK}▶${C_0}     ${C_DIM}main${C_0}      wt · one worktree per topic"
+  printf '%s\n' "        ${C_MINE}╰─◆${C_0}          ${C_DIM}topic${C_0}     ${C_DIM}every checkout a sibling${C_0}"
+  printf '\n'
+}
+
+art_new() { # branch base
+  art_on || return 0
+  printf '\n'
+  printf '%s\n' "              ${C_MINE}╭─◆${C_0}   ${C_MINE}${1}${C_0}"
+  printf '%s\n' "    ${C_DIM}━━●━━━●━━━${C_MINE}┷${C_DIM}━━━━━━━━${C_OK}▶${C_0}   ${2}"
+  printf '\n'
+}
+
+art_sync() {
+  art_on || return 0
+  printf '\n'
+  printf '%s\n' "      ${C_MINE}╭─◆─◆${C_0}                              ${C_MINE}╭─◆─◆${C_0}"
+  printf '%s\n' "    ${C_DIM}━━${C_MINE}┷${C_DIM}━━●━━●${C_0}   base moved   ${C_OK}→${C_0}   ${C_DIM}━━●━━●━━${C_MINE}┷${C_0}   ${C_OK}rebased${C_0}"
+  printf '\n'
+}
+
+art_pr() { # n squashed
+  art_on || return 0
+  printf '\n'
+  if [[ "$2" == 1 ]]; then
+    printf '%s\n' "    ${C_MINE}$(chain "$1")${C_0}   ${C_OK}→${C_0}   ${C_PATH}◇${C_0} ${C_PATH}────▶${C_0}  ${C_PATH}PR${C_0}      ${C_DIM}${1} commits squashed to 1${C_0}"
+  else
+    printf '%s\n' "    ${C_MINE}$(chain "$1")${C_0} ${C_PATH}────▶${C_0}  ${C_PATH}PR${C_0}      ${C_DIM}${1} commit(s) kept${C_0}"
+  fi
+  printf '\n'
+}
+
+art_rm() { # slug
+  art_on || return 0
+  printf '\n'
+  printf '%s\n' "        ${C_DIM}╭╌◆╌╌◆  ${1}  ✕${C_0}"
+  printf '%s\n' "    ${C_DIM}━━●━${C_MINE}┷${C_DIM}━●━━●━${C_OK}▶${C_0}   main   ${C_DIM}worktree pruned, branch gone${C_0}"
+  printf '\n'
+}
+
+art_init() { # wrapper repo store
+  art_on || return 0
+  local st="${3/#$HOME/\~}"
+  printf '\n'
+  printf '%s\n' "    ${1}/"
+  printf '%s\n' "    ${C_DIM}├── CLAUDE.md  ${C_PATH}▶${C_DIM}  ${C_PATH}${st}/CLAUDE.md${C_0}"
+  printf '%s\n' "    ${C_DIM}├── docs       ${C_PATH}▶${C_DIM}  ${C_PATH}${st}/${C_0}"
+  printf '%s\n' "    ${C_DIM}└── src/${2}/${C_0}"
+  printf '%s\n' "        ${C_DIM}┣━━ main/${C_0}         ${C_DIM}●  the clone, on the default branch${C_0}"
+  printf '%s\n' "        ${C_MINE}╰── <slug>/${C_0}       ${C_MINE}╭─◆${C_0}  ${C_DIM}wt new <slug>${C_0}"
+  printf '\n'
+}
+
+# ---------------------------------------------------------------------------
+# context: where am I
+# ---------------------------------------------------------------------------
+PROJ="" WRAP="" STORE="" REPO="" REPODIR="" MAIN="" CONF=""
+C_PREFIX="" C_BASE="origin" C_PUSH="origin" C_SQUASH="true" C_FORGE="auto" C_ALLOW="false" C_WEB=""
+
+# ctx_from_dir DIR → PROJ/WRAP/STORE and, when DIR is under src/<repo>, REPO/REPODIR/MAIN/CONF.
+ctx_from_dir() {
+  local d; d="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+  local root; root="$(cd "$WT_ROOT" 2>/dev/null && pwd -P)" || return 1
+  [[ "$d" == "$root"/* ]] || return 1
+  local rel="${d#"$root"/}"
+  PROJ="${rel%%/*}"
+  WRAP="$WT_ROOT/$PROJ"; STORE="$WT_STORE/$PROJ"
+  REPO=""; REPODIR=""; MAIN=""; CONF=""
+  local rest="${rel#"$PROJ"}"; rest="${rest#/}"
+  if [[ "$rest" == src/* ]]; then
+    rest="${rest#src/}"
+    REPO="${rest%%/*}"
+    [[ -n "$REPO" ]] && set_repo "$REPO"
+  fi
+  return 0
+}
+
+set_repo() {
+  REPO="$1"; REPODIR="$WRAP/src/$REPO"; MAIN="$REPODIR/main"; CONF="$STORE/repos/$REPO.conf"
+}
+
+# pick the repo when the caller stands in the wrapper: the only one, or --repo
+require_repo() {
+  [[ -n "$REPO" ]] && return 0
+  local cands=()
+  local d; for d in "$WRAP"/src/*/; do [[ -d "$d" ]] && cands+=("$(basename "$d")"); done
+  case ${#cands[@]} in
+    0) die "no repo under $WRAP/src — wt init --clone <url> first" ;;
+    1) set_repo "${cands[0]}" ;;
+    *) die "several repos under $WRAP/src (${cands[*]}) — cd into one or pass --repo" ;;
+  esac
+}
+
+require_main() {
+  require_repo
+  if [[ ! -d "$MAIN/.git" && ! -f "$MAIN/.git" ]]; then
+    [[ -d "$REPODIR/.git" ]] && die "$REPODIR is an old-layout clone — wt init --migrate"
+    die "$MAIN is not a clone — wt init --clone <url>"
+  fi
+}
+
+# conf_get KEY DEFAULT — grep, never source
+conf_get() {
+  local v=""
+  if [[ -f "$CONF" ]]; then
+    v="$(grep -E "^$1=" "$CONF" | tail -1 | cut -d= -f2- | sed -E 's/[[:space:]]+#.*$//; s/^[[:space:]]+//; s/[[:space:]]+$//')"
+  fi
+  printf '%s' "${v:-$2}"
+}
+
+load_conf() {
+  C_PREFIX="$(conf_get prefix "")"
+  C_BASE="$(conf_get base origin)"
+  C_PUSH="$(conf_get push origin)"
+  C_SQUASH="$(conf_get squash true)"
+  C_FORGE="$(conf_get forge auto)"
+  C_ALLOW="$(conf_get allow_interp false)"
+  C_WEB="$(conf_get web "")"
+}
+
+# ---------------------------------------------------------------------------
+# git helpers
+# ---------------------------------------------------------------------------
+gm() { git -C "$MAIN" "$@"; }
+
+# default branch of $C_BASE: remote HEAD, else set-head (network), else probe
+defbr() {
+  local b
+  b="$(gm symbolic-ref --short "refs/remotes/$C_BASE/HEAD" 2>/dev/null || true)"
+  if [[ -z "$b" ]]; then
+    gm remote set-head "$C_BASE" -a >/dev/null 2>&1 || true
+    b="$(gm symbolic-ref --short "refs/remotes/$C_BASE/HEAD" 2>/dev/null || true)"
+  fi
+  if [[ -z "$b" ]]; then
+    for cand in main master; do
+      gm show-ref -q --verify "refs/remotes/$C_BASE/$cand" && { b="$C_BASE/$cand"; break; }
+    done
+  fi
+  [[ -n "$b" ]] || die "cannot resolve the default branch of $C_BASE"
+  printf '%s' "${b#"$C_BASE"/}"
+}
+
+remote_url() { gm remote get-url "$1" 2>/dev/null || true; }
+
+# parse_url URL → U_HOST U_OWNER U_NAME  (ssh://u@h[:p]/o/r, u@h:o/r.git, https://h/o/r)
+U_HOST="" U_OWNER="" U_NAME=""
+parse_url() {
+  local u="$1" path=""
+  U_HOST=""; U_OWNER=""; U_NAME=""
+  if [[ "$u" =~ ^[a-z+]+://([^@/]+@)?([^/:]+)(:[0-9]+)?/(.+)$ ]]; then
+    U_HOST="${BASH_REMATCH[2]}"; path="${BASH_REMATCH[4]}"
+  elif [[ "$u" =~ ^([^@/]+@)?([^:/]+):(.+)$ ]]; then
+    U_HOST="${BASH_REMATCH[2]}"; path="${BASH_REMATCH[3]}"
+  else
+    return 1
+  fi
+  path="${path%/}"; path="${path%.git}"
+  U_NAME="${path##*/}"
+  U_OWNER="${path%/*}"; [[ "$U_OWNER" == "$path" ]] && U_OWNER=""
+  return 0
+}
+
+# forge_of HOST → github|forgejo|gitlab|unknown. A repo conf's forge= wins;
+# then the wt.forge config list ("<glob> <kind>" per line, first match wins,
+# config.local before config), which is where a site's own forge hosts live;
+# then the public forges.
+forge_of() {
+  if [[ "$C_FORGE" != "auto" && -n "$C_FORGE" ]]; then printf '%s' "$C_FORGE"; return; fi
+  local rule glob kind
+  while IFS= read -r rule; do
+    read -r glob kind _ <<<"$rule"
+    case "$kind" in github|gitlab|forgejo) ;; *) continue ;; esac
+    # shellcheck disable=SC2053  # the glob is a pattern on purpose
+    [[ "$1" == $glob ]] && { printf '%s' "$kind"; return; }
+  done < <(sc_conf_all wt.forge)
+  case "$1" in
+    github.com|github-*) printf 'github' ;;
+    gitlab.com|*gitlab*) printf 'gitlab' ;;
+    codeberg.org)        printf 'forgejo' ;;
+    *)                   printf 'unknown' ;;
+  esac
+}
+
+# web_base HOST FORGE → https://host the browser and the API use
+web_base() {
+  if [[ -n "$C_WEB" ]]; then printf '%s' "${C_WEB%/}"; return; fi
+  case "$2" in
+    github) printf 'https://github.com' ;;
+    *)      printf 'https://%s' "$1" ;;
+  esac
+}
+
+token() {
+  if [[ -n "${FORGEJO_TOKEN:-}" ]]; then printf '%s' "$FORGEJO_TOKEN"; return 0; fi
+  [[ -r "$WT_TOKEN_FILE" ]] && { tr -d '\n' < "$WT_TOKEN_FILE"; return 0; }
+  return 1
+}
+
+# forgejo_api METHOD PATH [JSON]  (prints body; non-2xx → return 1 with body on stderr)
+forgejo_api() {
+  need curl; need jq
+  local tok; tok="$(token)" || return 1
+  local m="$1" p="$2" data="${3:-}" out code
+  local api="$WEB/api/v1"
+  if [[ -n "$data" ]]; then
+    out="$(curl -sS -w '\n%{http_code}' -X "$m" -H "Authorization: token $tok" -H 'Content-Type: application/json' "$api$p" -d "$data")"
+  else
+    out="$(curl -sS -w '\n%{http_code}' -X "$m" -H "Authorization: token $tok" "$api$p")"
+  fi
+  code="${out##*$'\n'}"; out="${out%$'\n'*}"
+  [[ "$code" =~ ^2 ]] || { printf '%s\n' "$out" >&2; return 1; }
+  printf '%s' "$out"
+}
+
+# ahead_behind DIR BASEREF → "ahead behind" against BASEREF
+ahead_behind() {
+  local lr; lr="$(git -C "$1" rev-list --left-right --count "$2...HEAD" 2>/dev/null || echo "0 0")"
+  printf '%s %s' "${lr##*[[:space:]]}" "${lr%%[[:space:]]*}"
+}
+
+is_dirty() { [[ -n "$(git -C "$1" status --porcelain 2>/dev/null)" ]]; }
+
+ensure_exclude() {
+  local common; common="$(gm rev-parse --path-format=absolute --git-common-dir)"
+  mkdir -p "$common/info"
+  local f="$common/info/exclude" added=""
+  for line in CLAUDE.local.md .claude/; do
+    grep -qxF "$line" "$f" 2>/dev/null || { printf '%s\n' "$line" >> "$f"; added+=" + $line"; }
+  done
+  row exclude ".git/info/exclude" "$( [[ -n "$added" ]] && ok "${added# }" || dim "present" )"
+}
+
+# ---------------------------------------------------------------------------
+# store templates
+# ---------------------------------------------------------------------------
+# render_tpl FILE — a template from wt.templates with {{PROJ}} {{WRAP}}
+# {{STORE}} filled in. Text substitution only; nothing in it is evaluated.
+render_tpl() {
+  local t; t="$(cat "$1")"
+  t="${t//\{\{PROJ\}\}/$PROJ}"; t="${t//\{\{WRAP\}\}/$WRAP}"; t="${t//\{\{STORE\}\}/$STORE}"
+  printf '%s\n' "$t"
+}
+
+seed_store() {
+  mkdir -p "$STORE/repos" "$STORE/topics"
+  if [[ ! -e "$STORE/README.md" ]]; then
+    if [[ -r "$WT_TEMPLATES/store-README.md" ]]; then
+      render_tpl "$WT_TEMPLATES/store-README.md" > "$STORE/README.md"
+    else
+      cat > "$STORE/README.md" <<EOF
+# $PROJ — working notes
+
+Durable store, symlinked into \`$WRAP/docs\`. Keep it in git and pushed: the
+worktree root holds only what a command can recreate, and notes have no
+recreating command.
+
+\`repos/<repo>.conf\` holds each repo's branch/PR conventions (read by \`wt\`).
+\`topics/<slug>.md\` is one note per topic branch, seeded by \`wt new\` and linked
+into the worktree as \`CLAUDE.local.md\`.
+EOF
+    fi
+    row store "$STORE/README.md" "$(ok written)"
+  fi
+  if [[ ! -e "$STORE/CLAUDE.md" ]]; then
+    cat > "$STORE/CLAUDE.md" <<EOF
+# $PROJ — project context
+
+<one line: what this project is, and what you are currently doing>
+
+## Layout
+
+\`\`\`
+$WRAP/
+├── CLAUDE.md -> $STORE/CLAUDE.md
+├── docs      -> $STORE/
+└── src/<repo>/
+    ├── main/            the clone; stays on the default branch
+    └── <slug>/          topic worktree (wt new); CLAUDE.local.md -> docs/topics/<slug>.md
+\`\`\`
+
+Conventions per repo live in \`docs/repos/<repo>.conf\`; \`wt\` reads them.
+
+## Repo conventions
+
+- host / PR model: <forgejo|github|gitlab; PR-only main?>
+- branch naming: <the convention actually used in the repo's history>
+- acceptance gates: <where they are defined>
+
+## Data
+
+<mount paths, coverage, footguns>
+
+## This box
+
+<what it is provisioned for, and what it is NOT>
+EOF
+    row store "$STORE/CLAUDE.md" "$(ok written) $(dim 'fill it in')"
+  fi
+}
+
+seed_topic_note() { # slug branch wtdir
+  local f="$STORE/topics/$1.md"
+  [[ -e "$f" ]] && return 0
+  mkdir -p "$STORE/topics"
+  cat > "$f" <<EOF
+# $1
+
+**branch:** \`$2\`  **worktree:** \`${3#"$WT_ROOT"/}\`  **base:** \`$C_BASE/$DEFBR\`${FROM:+  **from:** \`$FROM\`}
+**started:** $(date +%Y-%m-%d)
+
+## Goal
+<one line — what lands when this is done>
+
+## Acceptance gate
+<the gate, quoted from the plan item if there is one>
+
+## Log
+-
+EOF
+}
+
+link_symlinks() {
+  for pair in "CLAUDE.md:$STORE/CLAUDE.md" "docs:$STORE"; do
+    local name="${pair%%:*}" target="${pair#*:}" p="$WRAP/${pair%%:*}"
+    if [[ -L "$p" ]]; then
+      [[ "$(readlink "$p")" == "$target" ]] && { row link "$name → ${target/#$HOME/\~}" "$(dim present)"; continue; }
+      warn "$p points elsewhere ($(readlink "$p")) — left alone"
+    elif [[ -e "$p" ]]; then
+      warn "$p exists and is not a symlink — left alone"
+    else
+      ln -s "$target" "$p"; row link "$name → ${target/#$HOME/\~}" "$(ok ok)"
+    fi
+  done
+}
+
+write_allows() {
+  local f="$MAIN/.claude/settings.local.json"
+  if [[ -e "$f" ]]; then row allows "${f#"$WT_ROOT"/}" "$(dim 'exists, left alone')"; return; fi
+  mkdir -p "$MAIN/.claude"
+  cat > "$f" <<'EOF'
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 *)",
+      "Bash(python *)",
+      "Bash(pytest *)",
+      "Bash(ruff *)"
+    ]
+  }
+}
+EOF
+  row allows "${f#"$WT_ROOT"/}" "$(ok 'Bash(python3 *) Bash(python *) Bash(pytest *) Bash(ruff *)')"
+}
+
+# infer_prefix → most common "dir/" prefix among remote branches whose tip I authored
+infer_prefix() {
+  local me; me="$(gm config user.email 2>/dev/null || true)"
+  [[ -n "$me" ]] || { printf ''; return; }
+  gm for-each-ref --format='%(refname:short) %(authoremail)' "refs/remotes/$C_BASE" 2>/dev/null \
+    | awk -v me="<$me>" -v base="$C_BASE/" '
+        $2 == me { b = substr($1, length(base) + 1); n = split(b, parts, "/");
+                   if (n > 1) { pre = b; sub(/[^\/]+$/, "", pre);
+                                if (pre ~ /^(claude|dependabot|renovate)\//) next;   # bot branches are not a convention
+                                c[pre]++ } }
+        END { best = ""; bn = 0; for (p in c) if (c[p] > bn) { best = p; bn = c[p] }
+              if (bn >= 1) printf "%s", best }'
+}
+
+write_conf() { # writes $CONF if absent; prints inferred values
+  local base=origin prefix forge web="" host
+  gm remote get-url upstream >/dev/null 2>&1 && base=upstream
+  C_BASE="$base"
+  prefix="$(infer_prefix)"
+  local url; url="$(remote_url "$base")"
+  if parse_url "$url"; then
+    host="$U_HOST"; C_FORGE=auto; forge="$(forge_of "$host")"
+    case "$host" in
+      github-*) web="https://github.com" ;;
+      *[0-9].[0-9]*) web="" ;;  # bare IP: web host must be filled by hand
+    esac
+  else
+    forge=unknown; host="?"
+  fi
+  if [[ -e "$CONF" ]]; then
+    row conf "${CONF/#$HOME/\~}" "$(dim present)"
+  else
+    mkdir -p "$(dirname "$CONF")"
+    cat > "$CONF" <<EOF
+# $REPO — conventions read by wt. key=value, one per line; '#' comments allowed.
+prefix=$prefix
+base=$base
+push=origin
+squash=true
+forge=$forge
+allow_interp=$ALLOW_FLAG
+web=$web
+EOF
+    row conf "${CONF/#$HOME/\~}" "$(ok written)"
+  fi
+  load_conf
+  printf '           prefix=%q  base=%s  push=%s  squash=%s  forge=%s  allow_interp=%s%s\n' \
+    "$C_PREFIX" "$C_BASE" "$C_PUSH" "$C_SQUASH" "$C_FORGE" "$C_ALLOW" "${C_WEB:+  web=$C_WEB}"
+  if [[ "$forge" == forgejo && -z "$web" && "$host" =~ [0-9]\.[0-9] ]]; then
+    warn "origin host is an IP — set web=https://<forge host> in the conf for PR URLs"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# init
+# ---------------------------------------------------------------------------
+cmd_init() {
+  local MIGRATE=0 YES=0 PROJECT="" CLONE="" NEW="" REMOTE="" FORGE="" ORG="" REPO_ARG=""
+  ALLOW_FLAG=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --migrate) MIGRATE=1 ;;
+      --mine) ALLOW_FLAG=true ;;
+      -y|--yes) YES=1 ;;
+      --project) PROJECT="$2"; shift ;;
+      --clone) CLONE="$2"; shift ;;
+      --new) NEW="$2"; shift ;;
+      --remote) REMOTE="$2"; shift ;;
+      --forge) FORGE="$2"; shift ;;
+      --org) ORG="$2"; shift ;;
+      --repo) REPO_ARG="$2"; shift ;;
+      -h|--help) usage; return 0 ;;
+      *) die "init: unknown option $1" ;;
+    esac; shift
+  done
+
+  if [[ -n "$PROJECT" ]]; then
+    PROJ="$PROJECT"; WRAP="$WT_ROOT/$PROJ"; STORE="$WT_STORE/$PROJ"
+    [[ -n "$REPO_ARG" ]] && set_repo "$REPO_ARG"
+  else
+    ctx_from_dir "$PWD" || die "not under $WT_ROOT — cd into a project or pass --project <slug>"
+    [[ -n "$REPO_ARG" ]] && set_repo "$REPO_ARG"
+  fi
+  mkdir -p "$WRAP/src"
+  row project "$PROJ" "$C_PATH$WRAP$C_0"
+
+  if [[ -n "$CLONE" ]]; then
+    local name; name="$(basename "$CLONE")"; name="${name%.git}"
+    set_repo "$name"
+    if [[ -e "$MAIN" ]]; then
+      row clone "src/$REPO/main" "$(dim 'exists, skipped')"
+    else
+      mkdir -p "$REPODIR"
+      git clone -q "$CLONE" "$MAIN" || die "clone failed"
+      row clone "src/$REPO/main" "$(ok ok)"
+    fi
+  elif [[ -n "$NEW" ]]; then
+    set_repo "$NEW"
+    [[ -e "$MAIN" ]] && die "$MAIN exists"
+    mkdir -p "$MAIN"
+    git -C "$MAIN" init -q -b main
+    git -C "$MAIN" commit -q --allow-empty -m "repo scaffold"
+    row init "src/$REPO/main" "$(ok 'git init -b main · empty root commit')"
+    if [[ -n "$REMOTE" ]]; then
+      git -C "$MAIN" remote add origin "$REMOTE"
+      git -C "$MAIN" push -q -u origin main && row push "origin main -u" "$(ok ok)" || warn "push failed — fix the remote, then git push -u origin main"
+    elif [[ -n "$FORGE" && -n "$ORG" ]]; then
+      case "$FORGE" in
+        forgejo)
+          WEB="${WT_FORGE_WEB:-$(sc_conf wt.forgejo_web "")}"
+          [[ -n "$WEB" ]] || die "creating a Forgejo repo needs its web URL: set wt.forgejo_web in $(sc_conf_home)/config (or WT_FORGE_WEB)"
+          local body; body="$(jq -n --arg n "$REPO" '{name:$n, private:true, default_branch:"main", auto_init:false}')"
+          local resp; resp="$(forgejo_api POST "/orgs/$ORG/repos" "$body")" || die "Forgejo refused to create $ORG/$REPO (token? org rights?)"
+          local ssh_url; ssh_url="$(printf '%s' "$resp" | jq -r .ssh_url)"
+          git -C "$MAIN" remote add origin "$ssh_url"
+          row remote "POST /api/v1/orgs/$ORG/repos" "$(ok 201) $(dim 'private, default_branch main')"
+          row "" "origin = $ssh_url"
+          git -C "$MAIN" push -q -u origin main && row push "origin main -u" "$(ok ok)" ;;
+        github)
+          need gh
+          (cd "$MAIN" && gh repo create "$ORG/$REPO" --private --source . --remote origin --push >/dev/null) \
+            && row remote "gh repo create $ORG/$REPO" "$(ok 'private, pushed')" || die "gh repo create failed"
+          ;;
+        *) die "--forge must be forgejo or github" ;;
+      esac
+    else
+      row remote "none yet" "$(dim 'create it on the forge, then: git -C '"$MAIN"' remote add origin <url> && git push -u origin main')"
+    fi
+  elif [[ $MIGRATE -eq 1 ]]; then
+    require_repo
+    if [[ -d "$REPODIR/.git" ]]; then
+      is_dirty "$REPODIR" && die "$REPODIR is dirty — commit or stash before migrating"
+      local n; n="$(git -C "$REPODIR" worktree list --porcelain | grep -c '^worktree ' || true)"
+      [[ "$n" -gt 1 ]] && die "$REPODIR has $((n-1)) linked worktree(s) — move them first"
+      local tmp="$WRAP/src/.$REPO.migrating"
+      mv "$REPODIR" "$tmp" && mkdir -p "$REPODIR" && mv "$tmp" "$MAIN"
+      row migrate "src/$REPO → src/$REPO/main" "$(ok 'clean, no linked worktrees')"
+    elif [[ -d "$MAIN/.git" ]]; then
+      row migrate "src/$REPO/main" "$(dim 'already new layout')"
+    else
+      die "nothing to migrate at $REPODIR"
+    fi
+  else
+    require_main
+  fi
+  require_main
+
+  local url; url="$(remote_url origin)"
+  row repo "$REPO" "${url:-$(dim 'no origin')}"
+
+  seed_store
+  link_symlinks
+  write_conf
+  ensure_exclude
+  if [[ -d "$MAIN/scripts/hooks" ]]; then
+    if [[ -z "$(gm config --local core.hooksPath || true)" ]]; then
+      gm config --local core.hooksPath scripts/hooks; row hooks "scripts/hooks" "$(ok 'core.hooksPath set')"
+    else
+      row hooks "scripts/hooks" "$(dim 'core.hooksPath already set')"
+    fi
+  else
+    row hooks "scripts/hooks" "$(dim 'not present, skipped')"
+  fi
+  [[ "$ALLOW_FLAG" == true || "$C_ALLOW" == true ]] && write_allows
+  if token >/dev/null; then row token "${WT_TOKEN_FILE/#$HOME/\~}" "$(ok ok)"
+  else row token "${WT_TOKEN_FILE/#$HOME/\~}" "$(bad MISSING) $(dim '— wt pr prints a compare URL until it exists')"; fi
+  art_init "$WRAP" "$REPO" "$STORE"
+  row next "fill ${STORE/#$HOME/\~}/CLAUDE.md · wt new <slug>" ""
+}
+
+# ---------------------------------------------------------------------------
+# new
+# ---------------------------------------------------------------------------
+cmd_new() {
+  local SLUG="" PREFIX_ARG="" TRACK="" FROM="" REPO_ARG=""
+  local have_prefix=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --prefix) PREFIX_ARG="$2"; have_prefix=1; shift ;;
+      --track) TRACK="$2"; shift ;;
+      --from) FROM="$2"; shift ;;
+      --repo) REPO_ARG="$2"; shift ;;
+      -h|--help) usage; return 0 ;;
+      -*) die "new: unknown option $1" ;;
+      *) [[ -z "$SLUG" ]] && SLUG="$1" || die "new: one slug only" ;;
+    esac; shift
+  done
+  ctx_from_dir "$PWD" || die "not under $WT_ROOT"
+  [[ -n "$REPO_ARG" ]] && set_repo "$REPO_ARG"
+  require_main; load_conf
+  [[ $have_prefix -eq 1 ]] && C_PREFIX="$PREFIX_ARG"
+
+  gm fetch -q "$C_BASE" --prune || die "fetch $C_BASE failed"
+  row fetch "$C_BASE --prune" "$(ok ok)"
+  DEFBR="$(defbr)"
+
+  local branch
+  if [[ -n "$TRACK" ]]; then
+    branch="${TRACK#"$C_BASE"/}"
+    [[ -n "$SLUG" ]] || SLUG="${branch##*/}"
+  else
+    [[ -n "$SLUG" ]] || die "usage: wt new <slug>"
+    if [[ -n "$C_PREFIX" && "${C_PREFIX: -1}" != [/_.-] ]]; then
+      die "prefix \"$C_PREFIX\" has no trailing separator — \"$C_PREFIX$SLUG\" is almost certainly not what you want; use \"$C_PREFIX/\" (conf prefix= or --prefix)"
+    fi
+    branch="$C_PREFIX$SLUG"
+  fi
+  [[ "$SLUG" == */* ]] && die "slug \"$SLUG\" contains \"/\" — use --prefix ${SLUG%/*}/ ${SLUG##*/}"
+  [[ "$SLUG" == "main" || "$SLUG" == "$DEFBR" ]] && die "\"$SLUG\" is the default branch, not a topic"
+  local WTDIR="$REPODIR/$SLUG"
+  [[ -e "$WTDIR" ]] && die "$WTDIR exists"
+
+  art_new "$branch" "$C_BASE/$DEFBR"
+  local base_sha; base_sha="$(gm rev-parse --short "$C_BASE/$DEFBR")"
+  row base "$C_BASE/$DEFBR" "$base_sha  $(gm log -1 --format=%s "$C_BASE/$DEFBR" | cut -c1-60)"
+
+  if [[ -n "$TRACK" ]]; then
+    if gm show-ref -q --verify "refs/heads/$branch"; then
+      gm worktree add -q "$WTDIR" "$branch" || die "worktree add failed"
+      row branch "$branch" "$(dim 'existing local branch')"
+    elif gm show-ref -q --verify "refs/remotes/$C_BASE/$branch"; then
+      gm worktree add -q --track -b "$branch" "$WTDIR" "$C_BASE/$branch" || die "worktree add failed"
+      row branch "$branch" "$(dim "tracking $C_BASE/$branch")"
+    else
+      die "no branch $branch locally or on $C_BASE"
+    fi
+  else
+    gm show-ref -q --verify "refs/heads/$branch" && die "branch $branch already exists — wt new --track $branch"
+    gm show-ref -q --verify "refs/remotes/$C_BASE/$branch" && die "branch $branch exists on $C_BASE — wt new --track $branch"
+    gm worktree add -q --no-track -b "$branch" "$WTDIR" "${FROM:-$C_BASE/$DEFBR}" || die "worktree add failed"
+    row branch "$branch" "$(dim "prefix \"$C_PREFIX\"")"
+  fi
+  row worktree "${WTDIR#"$WT_ROOT"/}" "$(dim "git -C main worktree add -b $branch ../$SLUG ${FROM:-$C_BASE/$DEFBR}")"
+
+  seed_topic_note "$SLUG" "$branch" "$WTDIR"
+  row note "docs/topics/$SLUG.md" "$(ok seeded) $(dim '— fill Goal and Acceptance gate')"
+  if [[ -L "$WRAP/docs" ]]; then ln -sfn "../../../docs/topics/$SLUG.md" "$WTDIR/CLAUDE.local.md"
+  else ln -sfn "$STORE/topics/$SLUG.md" "$WTDIR/CLAUDE.local.md"; fi
+  row link "$SLUG/CLAUDE.local.md → docs/topics/$SLUG.md" "$(dim git-excluded)"
+  ensure_exclude
+
+  # disk: a C++ worktree wants its own build dir; warn when the root cannot hold one
+  local avail build=0
+  avail="$(df --output=avail -B1 "$WT_ROOT" 2>/dev/null | tail -1 | tr -d ' ')"
+  for b in "$MAIN"/build*; do [[ -d "$b" ]] && build=$(( build + $(du -sb "$b" 2>/dev/null | cut -f1) )); done
+  local availh; availh="$(numfmt --to=iec "${avail:-0}" 2>/dev/null || echo "${avail:-?}")"
+  if [[ "$build" -gt 0 && "${avail:-0}" -lt $(( 2 * build )) ]]; then
+    row disk "$WT_ROOT ${availh} free" "$(bad LOW) $(dim "main/build* is $(numfmt --to=iec "$build") — a per-worktree build will not fit")"
+  else
+    row disk "$WT_ROOT ${availh} free" "$(dim "$([[ $build -gt 0 ]] && echo "main/build* is $(numfmt --to=iec "$build")" || echo 'main/build* absent, no warning')")"
+  fi
+  printf '%s%s%s\n' "$C_PATH" "$WTDIR" "$C_0"
+}
+
+# ---------------------------------------------------------------------------
+# ls / path
+# ---------------------------------------------------------------------------
+# each_main [-a] → lines "PROJ REPO MAIN"
+each_main() {
+  local all="$1" p
+  if [[ "$all" == 1 ]]; then
+    for p in "$WT_ROOT"/*/src/*/main; do
+      [[ -d "$p/.git" || -f "$p/.git" ]] || continue
+      local rel="${p#"$WT_ROOT"/}"; printf '%s %s %s\n' "${rel%%/*}" "$(basename "$(dirname "$p")")" "$p"
+    done
+  else
+    ctx_from_dir "$PWD" || die "not under $WT_ROOT — use wt ls -a"
+    for p in "$WRAP"/src/*/main; do
+      [[ -d "$p/.git" || -f "$p/.git" ]] || continue
+      printf '%s %s %s\n' "$PROJ" "$(basename "$(dirname "$p")")" "$p"
+    done
+  fi
+}
+
+# pr_state BRANCH → short text about an open/merged PR for this head, or ""
+pr_state() {
+  local branch="$1" forge="$2"
+  case "$forge" in
+    github) need gh; (cd "$MAIN" && gh pr list --head "$branch" --state all --json number,state -q '.[0] | "#\(.number) \(.state|ascii_downcase)"' 2>/dev/null) || true ;;
+    forgejo)
+      token >/dev/null || return 0
+      local js; js="$(forgejo_api GET "/repos/$U_OWNER/$U_NAME/pulls?state=all&limit=50" 2>/dev/null)" || return 0
+      printf '%s' "$js" | jq -r --arg b "$branch" '[.[] | select(.head.ref==$b)] | .[0] // empty | "#\(.number) \(if .merged then "merged" elif .state=="open" then "open" else "closed" end)"' ;;
+    *) ;;
+  esac
+}
+
+cmd_ls() {
+  local ALL=0 PR=0 PORC=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in -a|--all) ALL=1 ;; --pr) PR=1 ;; --porcelain) PORC=1 ;; -h|--help) usage; return 0 ;; *) die "ls: unknown option $1" ;; esac; shift
+  done
+  [[ $PORC -eq 1 ]] || printf '%s%-10s %-18s %-16s %-36s %-8s %-5s %-4s %s%s\n' "$C_DIM" PROJECT REPO SLUG BRANCH "±BASE" DIRTY NOTE "$([[ $PR -eq 1 ]] && echo PR)" "$C_0"
+  local line
+  while read -r line; do
+    [[ -n "$line" ]] || continue
+    PROJ="${line%% *}"; line="${line#* }"; REPO="${line%% *}"; MAIN="${line#* }"
+    WRAP="$WT_ROOT/$PROJ"; STORE="$WT_STORE/$PROJ"; REPODIR="$WRAP/src/$REPO"; CONF="$STORE/repos/$REPO.conf"
+    load_conf
+    local DEFBR_L; DEFBR_L="$(gm symbolic-ref --short "refs/remotes/$C_BASE/HEAD" 2>/dev/null || echo "$C_BASE/main")"; DEFBR_L="${DEFBR_L#"$C_BASE"/}"
+    local forge=""; if [[ $PR -eq 1 ]]; then parse_url "$(remote_url "$C_BASE")" && forge="$(forge_of "$U_HOST")" && WEB="$(web_base "$U_HOST" "$forge")"; fi
+    local wtpath="" branch=""
+    while read -r k v; do
+      case "$k" in
+        worktree) wtpath="$v"; branch="" ;;
+        branch) branch="${v#refs/heads/}" ;;
+        detached) branch="(detached)" ;;
+        "")
+          [[ -n "$wtpath" ]] || continue
+          local slug; slug="$(basename "$wtpath")"
+          local ab; ab="$(ahead_behind "$wtpath" "$C_BASE/$DEFBR_L")"
+          local pm="=" ; [[ "$ab" != "0 0" ]] && pm="+${ab%% *}/-${ab##* }"
+          local dirty="·"; is_dirty "$wtpath" && dirty="*"
+          local note="·"; [[ -f "$STORE/topics/$slug.md" ]] && note="yes"
+          local prs=""; [[ $PR -eq 1 && "$slug" != main && -n "$forge" ]] && prs="$(pr_state "$branch" "$forge")"
+          if [[ $PORC -eq 1 ]]; then printf '%s\t%s\t%s\t%s\t%s\n' "$PROJ" "$REPO" "$slug" "$branch" "$wtpath"
+          else printf '%-10s %-18s %-16s %-36s %-8s %-5s %-4s %s\n' "$PROJ" "$REPO" "$slug" "$branch" "$pm" "$dirty" "$note" "${prs:-·}"; fi
+          wtpath="" ;;
+      esac
+    done < <(gm worktree list --porcelain; echo)
+  done < <(each_main "$ALL")
+}
+
+cmd_path() {
+  local q="${1:-}"
+  local rows; rows="$(cmd_ls -a --porcelain)"
+  local hits
+  if [[ -n "$q" ]]; then
+    hits="$(printf '%s\n' "$rows" | awk -F'\t' -v q="$q" 'index($1"/"$2"/"$3, q) || index($4, q)')"
+  else
+    hits="$rows"
+  fi
+  local n; n="$(printf '%s\n' "$hits" | grep -c . || true)"
+  if [[ "$n" -eq 1 ]]; then printf '%s\n' "$hits" | cut -f5; return 0; fi
+  if [[ "$n" -eq 0 ]]; then die "no worktree matches \"$q\""; fi
+  if command -v fzf >/dev/null 2>&1 && [[ -t 2 ]]; then
+    printf '%s\n' "$hits" | awk -F'\t' '{printf "%-10s %-18s %-16s %s\t%s\n", $1, $2, $3, $4, $5}' \
+      | fzf --with-nth=1 --delimiter='\t' --query="$q" --height=40% --reverse | cut -f2
+  else
+    printf '%s\n' "$hits" | awk -F'\t' '{print "  " $1 "/" $2 "/" $3 "  " $4}' >&2
+    die "\"$q\" is ambiguous ($n matches) — be more specific"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# sync / pr / rm
+# ---------------------------------------------------------------------------
+# in_topic → WT BRANCH DEFBR set; dies in main or on the default branch
+in_topic() {
+  ctx_from_dir "$PWD" || die "not under $WT_ROOT"
+  require_main; load_conf
+  WT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a checkout"
+  [[ "$(cd "$WT" && pwd -P)" == "$(cd "$MAIN" && pwd -P)" ]] && die "main is not a topic"
+  BRANCH="$(git -C "$WT" symbolic-ref --short HEAD 2>/dev/null)" || die "detached HEAD"
+  DEFBR="$(defbr)"
+  [[ "$BRANCH" == "$DEFBR" ]] && die "$BRANCH is the default branch, not a topic"
+  return 0
+}
+
+do_rebase() {
+  gm fetch -q "$C_BASE" || die "fetch $C_BASE failed"
+  row fetch "$C_BASE" "$(ok ok)"
+  local before; before="$(git -C "$WT" rev-list --count "$C_BASE/$DEFBR..HEAD")"
+  if git -C "$WT" merge-base --is-ancestor "$C_BASE/$DEFBR" HEAD; then
+    row rebase "onto $C_BASE/$DEFBR" "$(ok 'up to date')"; return 0
+  fi
+  if git -C "$WT" rebase -q "$C_BASE/$DEFBR" >/dev/null 2>&1; then
+    row rebase "onto $C_BASE/$DEFBR" "$(ok "$before commits replayed, 0 conflicts")"
+    art_sync
+  else
+    row rebase "onto $C_BASE/$DEFBR" "$(bad CONFLICT)"
+    git -C "$WT" diff --name-only --diff-filter=U | sed 's/^/           /'
+    printf '%sresolve%s   then git rebase --continue   %s· or git rebase --abort%s\n' "$C_DIM" "$C_0" "$C_DIM" "$C_0"
+    exit 1
+  fi
+}
+
+cmd_sync() { in_topic; do_rebase; }
+
+note_section() { # file heading → body lines of "## heading"
+  awk -v h="## $2" '$0==h{f=1;next} /^## /{f=0} f' "$1" | sed '/^[[:space:]]*$/d'
+}
+
+cmd_pr() {
+  local TITLE="" BODYFILE="" DRAFT=0 NOSQUASH=0 DRY=0 BASEBR=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -t|--title) TITLE="$2"; shift ;;
+      -b|--body-file) BODYFILE="$2"; shift ;;
+      --base) BASEBR="$2"; shift ;;
+      --draft) DRAFT=1 ;;
+      --no-squash) NOSQUASH=1 ;;
+      --dry-run) DRY=1 ;;
+      -h|--help) usage; return 0 ;;
+      *) die "pr: unknown option $1" ;;
+    esac; shift
+  done
+  in_topic
+  gm fetch -q "$C_BASE" || die "fetch $C_BASE failed"
+  # Stacked? HEAD contains a pushed topic branch that the default branch does not.
+  # Squashing to the default's merge-base would swallow that topic's commits into
+  # this PR (it happened once); so a stacked branch must name its base.
+  if [[ -z "$BASEBR" ]]; then
+    local note_from=""
+    # (pipefail: a note without a from: line must not kill the script)
+    note_from="$( { grep -oE '\*\*from:\*\* `[^`]+`' "$STORE/topics/${WT##*/}.md" 2>/dev/null || true; } | sed -E 's/.*`(.*)`/\1/' | sed "s|^$C_BASE/||")"
+    local ref parents=()
+    while read -r ref; do
+      ref="${ref#"$C_BASE"/}"
+      [[ "$ref" == "$DEFBR" || "$ref" == "$BRANCH" || "$ref" == HEAD ]] && continue
+      if git -C "$WT" merge-base --is-ancestor "$C_BASE/$ref" HEAD 2>/dev/null \
+         && ! git -C "$WT" merge-base --is-ancestor "$C_BASE/$ref" "$C_BASE/$DEFBR" 2>/dev/null; then
+        parents+=("$ref")
+      fi
+    done < <(gm for-each-ref --format='%(refname:short)' "refs/remotes/$C_BASE")
+    if [[ ${#parents[@]} -gt 0 ]]; then
+      if [[ -n "$note_from" ]] && printf '%s\n' "${parents[@]}" | grep -qx "$note_from"; then
+        BASEBR="$note_from"
+        row stacked "on $C_BASE/$BASEBR" "$(dim "from the topic note — pass --base to override")"
+      else
+        die "this branch contains commits of $C_BASE/${parents[*]} that $C_BASE/$DEFBR lacks — it is stacked; say which: wt pr --base ${parents[0]}"
+      fi
+    fi
+  fi
+  if [[ -n "$BASEBR" ]]; then
+    # a stacked PR: rebase onto and target another topic branch instead of the default
+    gm show-ref -q --verify "refs/remotes/$C_BASE/$BASEBR" || die "--base $BASEBR is not on $C_BASE — push it first"
+    [[ "$BASEBR" == "$DEFBR" ]] && die "--base $BASEBR is the default branch; drop the flag"
+    [[ "$BASEBR" == "$BRANCH" ]] && die "--base $BASEBR is this branch"
+    DEFBR="$BASEBR"
+    row base "$C_BASE/$DEFBR" "$(dim 'stacked — rebases onto and targets this branch')"
+  fi
+  is_dirty "$WT" && die "dirty tree: $(git -C "$WT" status --porcelain | wc -l | tr -d ' ') path(s) — commit or stash"
+  row preflight "clean tree · branch $BRANCH ≠ $DEFBR" "$(ok ok)"
+
+  local url forge; url="$(remote_url "$C_BASE")"
+  parse_url "$url" || die "cannot parse remote URL $url"
+  forge="$(forge_of "$U_HOST")"; WEB="$(web_base "$U_HOST" "$forge")"
+
+  if [[ $DRY -eq 1 ]]; then
+    local ab; ab="$(ahead_behind "$WT" "$C_BASE/$DEFBR")"
+    row dry-run "ahead ${ab%% *} / behind ${ab##* } of $C_BASE/$DEFBR" "$(dim 'no rebase, no push')"
+    row squash "$( [[ "$C_SQUASH" == true && $NOSQUASH -eq 0 ]] && echo "${ab%% *} commits → 1" || echo off )" "$(dim "squash=$C_SQUASH")"
+    row forge "$forge · $U_HOST · $U_OWNER/$U_NAME" "$(dim "$WEB")"
+    row title "${TITLE:-$(git -C "$WT" log -1 --format=%s)}" ""
+    git -C "$WT" log --reverse --format='           - %s' "$C_BASE/$DEFBR..HEAD"
+    return 0
+  fi
+
+  do_rebase
+
+  local n; n="$(git -C "$WT" rev-list --count "$C_BASE/$DEFBR..HEAD")"
+  [[ "$n" -gt 0 ]] || die "nothing to propose: $BRANCH has no commits beyond $C_BASE/$DEFBR"
+  if [[ -z "$TITLE" ]]; then
+    # The PR title is the thing reviewers see first; git's last-commit subject is
+    # only ever right for a one-commit branch (squashed or not — #6 shipped titled
+    # "docs/ONBOARDING.md: ..." because --no-squash skipped this check).
+    [[ "$n" -gt 1 ]] && die "$n commits need a PR title: -t \"...\" (the last commit's subject would name the whole PR)"
+    TITLE="$(git -C "$WT" log -1 --format=%s)"
+  fi
+  local carried; carried="$(git -C "$WT" log --reverse --format='- %s' "$C_BASE/$DEFBR..HEAD")"
+  local did_squash=0
+  if [[ "$C_SQUASH" == true && $NOSQUASH -eq 0 && "$n" -gt 1 ]]; then
+    did_squash=1
+    local bodies; bodies="$(git -C "$WT" log --reverse --format='%s%n%n%b' "$C_BASE/$DEFBR..HEAD" | sed '/^[[:space:]]*$/N;/^\n$/D')"
+    local mb; mb="$(git -C "$WT" merge-base HEAD "$C_BASE/$DEFBR")"
+    git -C "$WT" reset -q --soft "$mb"
+    git -C "$WT" commit -q -m "$TITLE" -m "Squashed from $n commits:" -m "$bodies"
+    row squash "$n commits → 1" "$(ok "$(git -C "$WT" rev-parse --short HEAD)") $(dim 'subjects carried into the body')"
+  else
+    row squash "off" "$(dim "$n commit(s) kept$( [[ $NOSQUASH -eq 1 ]] && echo ' (--no-squash)' || [[ "$C_SQUASH" != true ]] && echo " (squash=$C_SQUASH)" || true)")"
+  fi
+
+  # push: plain when fast-forward, force-with-lease when history was rewritten
+  if git -C "$WT" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+    if git -C "$WT" merge-base --is-ancestor '@{u}' HEAD; then
+      git -C "$WT" push -q "$C_PUSH" "$BRANCH" || die "push failed"
+      row push "$C_PUSH $BRANCH" "$(ok fast-forward)"
+    else
+      git -C "$WT" push -q --force-with-lease "$C_PUSH" "$BRANCH" || die "push --force-with-lease refused: upstream moved — fetch, inspect, retry"
+      row push "$C_PUSH $BRANCH" "$(ok --force-with-lease) $(dim 'history rewritten')"
+    fi
+  else
+    git -C "$WT" push -q -u "$C_PUSH" "$BRANCH" || die "push failed"
+    row push "$C_PUSH $BRANCH" "$(ok 'new upstream')"
+  fi
+
+  art_pr "$n" "$did_squash"
+
+  # body
+  local body
+  if [[ -n "$BODYFILE" ]]; then body="$(cat "$BODYFILE")"
+  else
+    local note="$STORE/topics/${WT##*/}.md" goal="" gate=""
+    [[ -f "$note" ]] && { goal="$(note_section "$note" Goal)"; gate="$(note_section "$note" "Acceptance gate")"; }
+    body="$(printf '## Goal\n%s\n\n## Acceptance gate\n%s\n\n## Commits\n%s\n' "${goal:-_not stated_}" "${gate:-_not stated_}" "$carried")"
+  fi
+  [[ "$forge" != unknown ]] && row forge "$forge · $U_HOST · $U_OWNER/$U_NAME" ""
+
+  # head for fork checkouts: push remote owner differs from base remote owner
+  local prhead="$BRANCH"
+  if [[ "$C_PUSH" != "$C_BASE" ]]; then
+    local pu; pu="$(remote_url "$C_PUSH")"; local bo="$U_OWNER" bn="$U_NAME" bh="$U_HOST"
+    if parse_url "$pu"; then prhead="$U_OWNER:$BRANCH"; fi
+    U_OWNER="$bo"; U_NAME="$bn"; U_HOST="$bh"
+  fi
+
+  local prurl=""
+  case "$forge" in
+    github)
+      need gh
+      prurl="$(cd "$WT" && gh pr list --head "$BRANCH" --state open --json url -q '.[0].url' 2>/dev/null || true)"
+      if [[ -n "$prurl" ]]; then row pr "exists" "$C_PATH$prurl$C_0"
+      else
+        local dflag=(); [[ $DRAFT -eq 1 ]] && dflag=(--draft)
+        prurl="$(cd "$WT" && gh pr create --base "$DEFBR" --head "$prhead" --title "$TITLE" --body "$body" "${dflag[@]}")" || die "gh pr create failed"
+        row pr "gh pr create --base $DEFBR --head $head" "$(ok created)"; row "" "$C_PATH$prurl$C_0"
+      fi ;;
+    forgejo)
+      if token >/dev/null; then
+        local js; js="$(forgejo_api GET "/repos/$U_OWNER/$U_NAME/pulls?state=open&limit=50")" || die "Forgejo API refused (token scope?)"
+        prurl="$(printf '%s' "$js" | jq -r --arg b "$BRANCH" '[.[] | select(.head.ref==$b)] | .[0].html_url // empty')"
+        if [[ -n "$prurl" ]]; then row pr "exists" "$C_PATH$prurl$C_0"
+        else
+          local t="$TITLE"; [[ $DRAFT -eq 1 ]] && t="WIP: $TITLE"
+          local payload; payload="$(jq -n --arg h "$prhead" --arg b "$DEFBR" --arg t "$t" --arg body "$body" '{head:$h, base:$b, title:$t, body:$body}')"
+          js="$(forgejo_api POST "/repos/$U_OWNER/$U_NAME/pulls" "$payload")" || die "Forgejo refused to create the PR"
+          prurl="$(printf '%s' "$js" | jq -r .html_url)"
+          row pr "POST /api/v1/repos/$U_OWNER/$U_NAME/pulls" "$(ok 201)"; row "" "$C_PATH$prurl$C_0"
+        fi
+      else
+        local bf="${XDG_RUNTIME_DIR:-/tmp}/wt-pr-body.md"; printf '%s\n' "$body" > "$bf"
+        row token "${WT_TOKEN_FILE/#$HOME/\~}" "$(bad missing) $(dim '— falling back to the compare URL')"
+        prurl="$WEB/$U_OWNER/$U_NAME/compare/$DEFBR...$BRANCH"
+        row open "$C_PATH$prurl$C_0" ""
+        row body "$bf" "$(dim 'paste it into the PR')"
+      fi ;;
+    gitlab)
+      need glab
+      local dflag=(); [[ $DRAFT -eq 1 ]] && dflag=(--draft)
+      prurl="$(cd "$WT" && glab mr create --target-branch "$DEFBR" --source-branch "$BRANCH" --title "$TITLE" --description "$body" --yes "${dflag[@]}" 2>/dev/null | grep -Eo 'https?://[^ ]+' | tail -1)" || die "glab mr create failed"
+      row mr "glab mr create" "$(ok created)"; row "" "$C_PATH$prurl$C_0" ;;
+    *)
+      row forge "unknown host $U_HOST" "$(dim 'branch pushed; open the PR by hand')"
+      prurl="" ;;
+  esac
+
+  local note="$STORE/topics/${WT##*/}.md"
+  if [[ -n "$prurl" && -f "$note" ]]; then
+    printf -- '- %s PR opened: %s\n' "$(date +%Y-%m-%d)" "$prurl" >> "$note"
+    row note "docs/topics/${WT##*/}.md" "$(ok "+ $(date +%Y-%m-%d) PR opened: ${prurl##*/}")"
+  fi
+}
+
+cmd_rm() {
+  local SLUG="" FORCE=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in --force) FORCE=1 ;; -h|--help) usage; return 0 ;; -*) die "rm: unknown option $1" ;; *) SLUG="$1" ;; esac; shift
+  done
+  [[ -n "$SLUG" ]] || die "usage: wt rm <slug>"
+  ctx_from_dir "$PWD" || die "not under $WT_ROOT"
+  require_main; load_conf
+  [[ "$SLUG" == main ]] && die "main is the clone, not a topic"
+  local WTDIR="$REPODIR/$SLUG"
+  [[ -d "$WTDIR" ]] || die "$WTDIR does not exist"
+  local branch; branch="$(git -C "$WTDIR" symbolic-ref --short HEAD 2>/dev/null || echo "")"
+  DEFBR="$(defbr)"
+
+  if is_dirty "$WTDIR"; then
+    [[ $FORCE -eq 1 ]] || die "$SLUG has uncommitted changes — commit, or wt rm --force to discard"
+    warn "discarding uncommitted changes in $SLUG (--force)"
+  fi
+  gm fetch -q "$C_BASE" --prune 2>/dev/null || true
+  if [[ -n "$branch" ]]; then
+    local unpushed
+    if git -C "$WTDIR" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+      unpushed="$(git -C "$WTDIR" rev-list --count '@{u}..HEAD')"
+      [[ "$unpushed" -gt 0 && $FORCE -eq 0 ]] && die "$SLUG has $unpushed commit(s) not on $(git -C "$WTDIR" rev-parse --abbrev-ref '@{u}') — push, or wt rm --force to discard"
+    else
+      unpushed="$(git -C "$WTDIR" rev-list --count "$C_BASE/$DEFBR..HEAD")"
+      [[ "$unpushed" -gt 0 && $FORCE -eq 0 ]] && die "$SLUG has $unpushed commit(s) never pushed — wt pr, or wt rm --force to discard"
+    fi
+    local merged=0 how=""
+    if git -C "$WTDIR" merge-base --is-ancestor HEAD "$C_BASE/$DEFBR"; then merged=1; how="ancestor of $C_BASE/$DEFBR"
+    else
+      local url forge; url="$(remote_url "$C_BASE")"
+      if parse_url "$url"; then
+        forge="$(forge_of "$U_HOST")"; WEB="$(web_base "$U_HOST" "$forge")"
+        local st; st="$(pr_state "$branch" "$forge")"
+        [[ "$st" == *merged* ]] && { merged=1; how="forge says $st"; }
+      fi
+    fi
+    if [[ $merged -eq 1 ]]; then row merged "$how" "$(ok ok)"
+    elif [[ $FORCE -eq 1 ]]; then warn "$branch is not merged — deleting anyway (--force)"
+    else die "$branch is not merged into $C_BASE/$DEFBR (and no merged PR found) — wt rm --force to delete anyway"; fi
+  fi
+
+  local wf=(); [[ $FORCE -eq 1 ]] && wf=(--force)
+  gm worktree remove "${wf[@]}" "$WTDIR" || die "git worktree remove failed"
+  row remove "${WTDIR#"$WT_ROOT"/}" "$(ok 'git worktree remove')"
+  if [[ -n "$branch" ]]; then
+    gm branch -q -D "$branch" 2>/dev/null && row branch "$branch" "$(ok deleted)" || row branch "$branch" "$(dim 'not a local branch')"
+  fi
+  gm fetch -q "$C_BASE" --prune 2>/dev/null && row prune "$C_BASE" "$(ok ok)" || true
+  art_rm "$SLUG"
+  if [[ -f "$STORE/topics/$SLUG.md" ]]; then
+    mkdir -p "$STORE/topics/archive"
+    mv "$STORE/topics/$SLUG.md" "$STORE/topics/archive/$SLUG.md"
+    row note "docs/topics/$SLUG.md → topics/archive/" "$(dim 'the record of what was tried stays')"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# doctor
+# ---------------------------------------------------------------------------
+cmd_doctor() {
+  local ALL=0; [[ "${1:-}" == "-a" ]] && ALL=1
+  art_logo
+  local line
+  while read -r line; do
+    [[ -n "$line" ]] || continue
+    PROJ="${line%% *}"; line="${line#* }"; REPO="${line%% *}"; MAIN="${line#* }"
+    WRAP="$WT_ROOT/$PROJ"; STORE="$WT_STORE/$PROJ"; REPODIR="$WRAP/src/$REPO"; CONF="$STORE/repos/$REPO.conf"
+    load_conf
+    printf '%s%s / %s%s\n' "$C_PATH" "$PROJ" "$REPO" "$C_0"
+    local n; n="$(gm worktree list --porcelain | grep -c '^worktree ' || true)"
+    row "  layout" "src/$REPO/main is a clone · $((n-1)) linked worktree(s)" "$(ok ok)"
+    local l1="$( [[ -L "$WRAP/CLAUDE.md" ]] && echo y || echo n )" l2="$( [[ -L "$WRAP/docs" ]] && echo y || echo n )"
+    row "  links" "CLAUDE.md, docs → ${STORE/#$HOME/\~}" "$( [[ "$l1$l2" == yy ]] && ok ok || bad "missing ($( [[ $l1 == n ]] && echo CLAUDE.md) $( [[ $l2 == n ]] && echo docs)) — wt init" )"
+    row "  conf" "repos/$REPO.conf" "$( [[ -f "$CONF" ]] && ok ok || bad 'missing — wt init' )"
+    local hb; hb="$(gm symbolic-ref --short "refs/remotes/$C_BASE/HEAD" 2>/dev/null || true)"
+    row "  base" "$C_BASE/HEAD → ${hb#"$C_BASE"/}" "$( [[ -n "$hb" ]] && ok ok || bad "unset — git remote set-head $C_BASE -a" )"
+    local ex; ex="$(gm rev-parse --path-format=absolute --git-common-dir)/info/exclude"
+    local e1 e2; e1="$(grep -qxF CLAUDE.local.md "$ex" 2>/dev/null && echo y || echo n)"; e2="$(grep -qxF .claude/ "$ex" 2>/dev/null && echo y || echo n)"
+    row "  exclude" "CLAUDE.local.md · .claude/" "$( [[ "$e1$e2" == yy ]] && ok ok || bad 'incomplete — wt init' )"
+    local url forge="?"; url="$(remote_url "$C_BASE")"; parse_url "$url" && forge="$(forge_of "$U_HOST")"
+    case "$forge" in
+      forgejo)
+        if token >/dev/null; then
+          local mode="-"; [[ -f "$WT_TOKEN_FILE" ]] && mode="$(stat -c %a "$WT_TOKEN_FILE" 2>/dev/null || echo '?')"
+          row "  forge" "forgejo token" "$( [[ "$mode" == 600 || -n "${FORGEJO_TOKEN:-}" ]] && ok ok || bad "mode $mode, expected 600" )"
+        else row "  forge" "forgejo token" "$(bad MISSING) $(dim "(${WT_TOKEN_FILE/#$HOME/\~}, 0600)")"; fi ;;
+      github) row "  forge" "gh auth" "$( gh auth status >/dev/null 2>&1 && ok ok || bad 'not logged in' )" ;;
+      gitlab) row "  forge" "glab" "$( command -v glab >/dev/null && ok present || bad missing )" ;;
+      *) row "  forge" "$U_HOST" "$(bad 'unknown forge') $(dim 'set forge= in the conf')" ;;
+    esac
+    local avail total; avail="$(df -h --output=avail "$WT_ROOT" 2>/dev/null | tail -1 | tr -d ' ')"; total="$(df -h --output=size "$WT_ROOT" 2>/dev/null | tail -1 | tr -d ' ')"
+    local availb; availb="$(df --output=avail -B1 "$WT_ROOT" 2>/dev/null | tail -1 | tr -d ' ')"
+    row "  disk" "$WT_ROOT $avail free of $total" "$( [[ "${availb:-0}" -lt 5000000000 ]] && bad LOW || ok ok )"
+    local stale; stale="$(gm worktree prune --dry-run 2>/dev/null | grep -c . || true)"
+    row "  prune" "$stale stale worktree(s)" ""
+  done < <(each_main "$ALL")
+}
+
+# ---------------------------------------------------------------------------
+usage() {
+  sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  printf '\n%sman wt%s for the full page · %swt help <command>%s for one command · art on a tty (WT_ART=1 forces, WT_NO_ART=1 hides)\n' "$C_DIM" "$C_0" "$C_DIM" "$C_0"
+}
+
+# help [cmd] — synopsis, or the man page opened at one command
+cmd_help() {
+  local c="${1:-}"
+  if [[ -z "$c" ]]; then art_logo; usage; return 0; fi
+  [[ -f "$MANSRC" ]] || { usage; return 0; }
+  command -v man >/dev/null 2>&1 || { usage; return 0; }
+  if [[ -t 1 ]]; then
+    man -P "less -p '^   wt $c'" -l "$MANSRC"
+  else
+    MANWIDTH="${MANWIDTH:-100}" man -P cat -l "$MANSRC" | awk -v h="   wt $c" '
+      index($0, h) == 1 { f = 1 } f && /^   wt / && index($0, h) != 1 { exit } f'
+  fi
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    init)   cmd_init "$@" ;;
+    new)    cmd_new "$@" ;;
+    ls)     cmd_ls "$@" ;;
+    path)   cmd_path "$@" ;;
+    cd)     # a script cannot cd its parent shell; the zsh wrapper does. Be useful anyway.
+            local target; target="$(cmd_path "$@")" || exit 1
+            printf '%s\n' "$target"
+            printf '%swt cd needs the zsh wrapper (%sexec zsh%s or %ssource ~/.zshrc%s once); meanwhile:%s  cd "$(wt path %s)"\n' \
+              "$C_DIM" "$C_0$C_DIM" "$C_0$C_DIM" "$C_0$C_DIM" "$C_0$C_DIM" "$C_0" "${1:-}" >&2 ;;
+    sync)   cmd_sync "$@" ;;
+    pr)     cmd_pr "$@" ;;
+    rm)     cmd_rm "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    help)   cmd_help "$@" ;;
+    __id)   sc_id ;;
+    __parse) parse_url "$1" && { C_FORGE=auto; printf '%s %s %s %s\n' "$U_HOST" "$U_OWNER" "$U_NAME" "$(forge_of "$U_HOST")"; } ;;
+    -h|--help|"") cmd_help ;;
+    *) die "unknown subcommand $cmd (wt --help)" ;;
+  esac
+}
+
+main "$@"
+
+# sc-fleet — membership marker read by `sc`; identity is set near the top.

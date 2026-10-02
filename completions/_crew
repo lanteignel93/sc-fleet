@@ -1,0 +1,31 @@
+#compdef crew
+# zsh completion for crew.
+# Reached through the fpath entry ~/.zsh_functions; fleet.zsh autoloads and
+# compdefs it. Hand-written.
+#
+# The subcommand is declared inline in _arguments rather than through a
+# '->state' dispatch: with only one positional, the state machinery buys
+# nothing and calling _describe outside a parsed state prints
+# "compdescribe: no parsed state" whenever the cursor sits on an option.
+
+# Box names come from the shared rig roster when it exists. Parsed with grep,
+# never sourced, the same way the tools read it.
+_crew_boxes() {
+  local f="${RIG_BOXES:-${XDG_CONFIG_HOME:-$HOME/.config}/rig/boxes.conf}"
+  [[ -r "$f" ]] || { _message 'no roster yet (rig boxes creates it)'; return 1; }
+  local -a boxes
+  boxes=( ${(f)"$(grep '^box=' "$f" 2>/dev/null | cut -d= -f2- | grep -vx '@defaults')"} )
+  (( $#boxes )) && _describe -t boxes box boxes
+}
+
+_crew() {
+  _arguments -s \
+    '(-a --all)'{-a,--all}'[every box in the rig registry, read-only over ssh]' \
+    '--sample[measure a CPU delta so busy is measured, not inferred]' \
+    '--porcelain[tab-separated, no header, no colour]' \
+    '--box[limit to one box from the roster]:box:_crew_boxes' \
+    '(- *)'{-h,--help}'[the manual]' \
+    '1:command:((doctor\:can\ sessions\ be\ seen\ from\ here\ at\ all))'
+}
+
+_crew "$@"

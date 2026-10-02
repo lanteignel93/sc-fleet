@@ -1,0 +1,135 @@
+.TH ARM 1 "2026-10-02" "sc-fleet 0.1.0" "sc-fleet manual"
+.SH NAME
+arm \- re-arm running shells with the current fleet kit
+.SH SYNOPSIS
+.nf
+\fBarm\fR
+\fBarm\fR \fB-a\fR | \fB--all\fR
+\fBarm\fR \fB-s\fR | \fB--session\fR
+\fBarm ls\fR
+\fBarm doctor\fR
+.fi
+.SH DESCRIPTION
+A shell keeps the functions and completions it had when it started. Add a
+fleet tool and every shell already running is a day behind.
+.PP
+On 2026-09-21 seven of eight live panes were missing the \fBwt\fR shell
+function that had landed the day before; four of those shells were six days
+old. The workaround in the shell history was \fBexec zsh\fR, seven times in
+one week.
+.PP
+\fBarm\fR re-sources \fIfleet.zsh\fR, the idempotent subset of the shell
+configuration: the fleet's shell functions, the completion \fBfpath\fR entry
+and its \fBcompdef\fR registrations, and a \fBrehash\fR so newly installed
+binaries become visible.
+.SH WHY NOT RE-SOURCE THE RC
+Re-sourcing an oh-my-zsh \fI.zshrc\fR is not safe twice. It carries a
+powerlevel10k instant-prompt block meant to run once at startup, and its
+\fBPATH\fR appends are unguarded, so a second pass duplicates entries and
+re-registers prompt hooks. \fIfleet.zsh\fR exists precisely so there is a
+subset that \fIis\fR safe to source repeatedly.
+.SH COMMANDS
+.SS arm
+Re-arm this shell. This form is a \fBzsh function\fR, not the binary: a
+process cannot change its parent shell, the same wall \fBwt cd\fR hits. The
+function sources \fIfleet.zsh\fR in place.
+.PP
+If the function is missing, the binary prints the path and the one-line
+\fBsource\fR command that fixes it, rather than pretending to have acted.
+.SS arm -a, arm --all
+Re-arm every shell pane in every tmux session.
+.SS arm -s, arm --session
+Re-arm the panes of the current tmux session only.
+.SS arm -a -x, arm -s -x  (also --restart)
+Restart each shell instead of re-sourcing it: the sweep sends
+\fBexec zsh\fR (or \fBexec bash\fR) to every pane sitting at a prompt.
+Re-sourcing refreshes only what is idempotent; a prompt, a plugin style or a
+PATH computed at startup needs the shell to start again. State that lives in
+the shell (an activated venv, an exported variable, the in-memory history of
+that session) is lost, which is why this is a modifier and not the default.
+The line is sent under \fBnocorrect\fR so autocorrect cannot touch it.
+.SS arm ls
+One row per pane: its target, its current command, and whether it would be
+armed or skipped and why. Says why rather than silently omitting, because a
+pane missing from a list is indistinguishable from a pane that does not
+exist.
+.SS arm doctor
+Whether \fIfleet.zsh\fR is present, correctly linked, parses under
+\fBzsh -n\fR, and whether this shell has been through it. Read-only:
+diagnoses and names the fix, never repairs.
+.SH PANE SELECTION
+A pane is armed only when its current command is a shell
+(\fBzsh\fR or \fBbash\fR). That field being a shell is the test for "sitting
+at a prompt with no foreground job". Editors, pagers and Claude sessions are
+skipped, as are panes in copy mode, which swallow keys.
+.PP
+The pane \fBarm\fR itself runs in is included. Its \fBsource\fR line lands in
+the input buffer and runs the moment \fBarm\fR exits, which is why that row
+is annotated.
+.SH AUTOCORRECT
+\fBarm\fR sends \fBsource \fIpath\fR and never a typed command. With zsh
+argument autocorrect enabled, in any directory containing \fIsrc\fR the bare
+word \fBsc\fR makes zsh stop at
+.PP
+.RS
+correct 'sc' to 'src' [nyae]?
+.RE
+.PP
+which then consumes the following keystrokes as its answer. That corrupted
+two command streams on 2026-09-21. Sourcing an absolute path to an existing
+file never trips it. If you script against tmux panes yourself, prefix with
+\fBnocorrect\fR.
+.SH BOOTSTRAP
+A shell that started before a tool was installed does not have it in its
+command hash, so \fBarm\fR itself may be "command not found" in the very
+shell that needs it most. Escape hatches, cheapest first: \fBrehash\fR then
+\fBarm\fR; \fBsc arm\fR if \fBsc\fR is already known; \fBarm -a\fR from any
+shell that does have it; or \fBexec zsh\fR.
+.PP
+Once any shell sources \fIfleet.zsh\fR it ends with \fBrehash\fR, so this is
+a one-time problem per shell, not a recurring one.
+.SH ENVIRONMENT
+.TP
+.B ARM_FLEET
+Path to the file to source. Default: \fIshell/fleet.zsh\fR in the checkout the tool runs from.
+.TP
+.B ARM_ART
+Force the banner even into a pipe.
+.TP
+.B ARM_NO_ART \fRor\fB NO_COLOR
+Suppress art, or colour, respectively. At the same level "off" beats "on".
+.TP
+.B ARM_TRACE
+Run under \fBset -x\fR.
+.SH FILES
+.TP
+.I bin/arm
+The tool, in the sc-fleet checkout.
+.TP
+.I shell/fleet.zsh
+What it sources: the file beside the tool, found through the tool's own
+path. \fI.zshrc\fR sources it once at startup as
+\fI~/.local/share/sc-fleet/shell/fleet.zsh\fR, the stable link
+\fBinstall.sh\fR points at the checkout.
+.TP
+.I tests/test_arm.sh
+The test suite. Run: \fBbash tests/test_arm.sh\fR
+.SH EXIT STATUS
+0 on success; 1 on a refusal or when a pane send failed, with a
+\fBrefuse\fR or \fBwarn\fR line on stderr saying why. One unreachable pane
+does not abort the sweep.
+.SH EXAMPLES
+.nf
+.RS
+arm                    # this shell, after a git pull
+arm -a                 # every pane, after installing a new fleet tool
+arm -a -x              # every pane restarted, after a theme flip or an rc change
+arm ls                 # dry look: what would be touched
+arm doctor             # is fleet.zsh even linked here
+.RE
+.fi
+.SH SEE ALSO
+.BR sc (1),
+.BR wt (1),
+.BR crew (1),
+.BR zshcompsys (1)

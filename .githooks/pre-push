@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Last door before anything leaves: every commit's identities, messages and
+# blobs, every ref name, then gitleaks over history for credentials.
+set -euo pipefail
+top="$(git rev-parse --show-toplevel)"
+python3 "$top/tools/leakgate.py" --history --strict -q
+gl="$(command -v gitleaks || true)"; [[ -n "$gl" ]] || gl="$HOME/.local/bin/gitleaks"
+if [[ -x "$gl" ]]; then
+  "$gl" git --no-banner --redact --config "$top/.gitleaks.toml" "$top" >/dev/null ||
+    { echo "pre-push: gitleaks found something; run: gitleaks git --redact -v" >&2; exit 1; }
+else
+  echo "pre-push: gitleaks not installed; credential scan skipped" >&2
+fi

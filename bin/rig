@@ -1,0 +1,1306 @@
+#!/usr/bin/env bash
+# rig — what this box is, and whether it is current
+#
+#   rig                    this box: repos, timers, mounts, capacity
+#   rig status [-a]        the fleet, or every box in the roster
+#   rig sync               bring THIS box current
+#   rig push [-m MSG]      publish THIS box: commit what is dirty, push what is ahead
+#   rig doctor [--disk]    what is missing or misconfigured here
+#   rig boxes [--lint]     the roster itself
+#
+# Nothing knew what was true on which box. A morning report invented four
+# dead pipelines out of job logs under a mount that box did not have; a link
+# checker called nine unmounted citations rotted; a pushed fix read as
+# unpushed because the work was on the other machine; and two capacity walls
+# were hit in one day. All four are the same missing question.
+#
+# AUTHORITY: git remotes. Each box is a replica reconciling to its own
+# upstream, "in sync" means clean and level, and divergence is surfaced and
+# never auto-merged.
+#
+# REACH: read all, write local. Every box in the roster can be read over ssh;
+# only the box you are sitting on is ever changed. `rig push` is the one verb
+# that writes past this box, and it writes only to this box's own upstreams,
+# only as a fast-forward.
+#
+# rig does not reimplement the idempotent installers a box already has (a repo
+# puller, a journal sync, a link installer, a timer installer). `rig sync`
+# sequences them and adds exactly two things they lack: noticing that the link
+# manifest has gained an entry, and reconciling the expected timer set against
+# the actual one. Which scripts those are is config, not code: rig.pull,
+# rig.journal, rig.installer, rig.timer_installer, rig.cron_installer in
+# ~/.config/sc-fleet/config. A stage whose script is not configured is skipped.
+#
+# NO SITE STRINGS. Hostnames, mounts and paths are roster data, config, or
+# probed; the leak gate keeps it that way.
+
+set -uo pipefail
+[[ -n "${RIG_TRACE:-}" ]] && set -x
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+LIBDIR="$(dirname "$SELF")/../lib"
+PROBE="$LIBDIR/rig-probe.sh"
+# The checkout this tool lives in: its git toplevel, whatever the layout.
+RIG_ROOT="$(git -C "$(dirname "$SELF")" rev-parse --show-toplevel 2>/dev/null ||
+            { cd "$(dirname "$SELF")/.." && pwd; })"
+if ! . "$LIBDIR/scconf.sh" 2>/dev/null; then
+  sc_conf() { printf '%s' "${2-}"; }
+fi
+
+BOXES="${RIG_BOXES:-${XDG_CONFIG_HOME:-$HOME/.config}/rig/boxes.conf}"
+LOCALCONF="${BOXES%.conf}.local.conf"
+STATE="${RIG_STATE:-$HOME/.local/state/rig}"
+RUN="${RIG_RUN:-${XDG_RUNTIME_DIR:-/tmp}/rig-$(id -u)}"
+PAR="${RIG_PAR:-6}"
+TIMEOUT="${RIG_TIMEOUT:-12}"
+
+# --- output -----------------------------------------------------------------
+SC_TOOL='rig'
+SC_TAGLINE='what this box is, and whether it is current'
+SC_MOTTO='git is the transport; every box is a replica'
+SC_SIGIL=$' ═◆ \n═╪═◆\n ═◆ '
+if . "$LIBDIR/sckit.sh" 2>/dev/null; then
+  C_DIM="$A_DIM" C_OK="$A_SEA" C_WARN="$A_ERR" C_PATH="$A_LAV" C_MINE="$A_LIME" C_0="$A_0"
+else   # the kit is optional: rig still runs on a box that has only this file
+  sc_mark() { :; }; sc_band() { :; }; sc_splash() { :; }; sc_id() { :; }
+  art_on() { [[ -n "${RIG_ART:-}" ]] && return 0; [[ -t 1 && -z "${RIG_NO_ART:-}" ]]; }
+  if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    C_DIM=$'\e[2m' C_OK=$'\e[32m' C_WARN=$'\e[31m' C_PATH=$'\e[35m' C_MINE=$'\e[92m' C_0=$'\e[0m'
+  else
+    C_DIM="" C_OK="" C_WARN="" C_PATH="" C_MINE="" C_0=""
+  fi
+  row()  { local l="$1" v="${2:-}"; shift 2 || true
+           printf '%s%-9s%s %-42s %s\n' "$C_DIM" "$l" "$C_0" "$v" "${*:-}"; }
+  ok()   { printf '%s%s%s' "$C_OK" "$*" "$C_0"; }
+  bad()  { printf '%s%s%s' "$C_WARN" "$*" "$C_0"; }
+  dim()  { printf '%s%s%s' "$C_DIM" "$*" "$C_0"; }
+  die()  { printf '%srefuse%s    %s\n' "$C_WARN" "$C_0" "$*" >&2; exit 1; }
+  warn() { printf '%swarn%s      %s\n' "$C_WARN" "$C_0" "$*" >&2; }
+fi
+MANSRC="$(dirname "$SELF")/../man/rig.1"
+
+# A wider label column than the kit's 9, for box and repo tables.
+brow() { local l="$1" v="${2:-}"; shift 2 || true
+         printf '%s%-22s%s %-30s %s\n' "$C_DIM" "$l" "$C_0" "$v" "${*:-}"; }
+
+# A path shortened to fit brow's label column: home becomes ~, and anything
+# still too long keeps its tail, which is the part that identifies it.
+shortlabel() { # PATH [WIDTH]
+  local s="${1/#$HOME/\~}" w="${2:-20}"
+  [[ ${#s} -le $w ]] && { printf '%s' "$s"; return; }
+  printf '…%s' "${s: -$((w - 1))}"
+}
+
+# bytes → 12.3G, for the disk rows.
+human_b() { awk -v b="${1:-0}" 'BEGIN{split("B K M G T P",u," "); for(i=1;b>=1024&&i<6;i++) b/=1024; printf "%.1f%s", b, u[i]}'; }
+
+RC=0                      # 0 = fine or transient, 1 = a human must act
+# Most findings are raised from inside a $( ) that renders the note column,
+# which is a SUBSHELL — a plain `RC=1` there is discarded, and every such
+# finding was silently lost. A flag file survives the subshell; rc_final()
+# reads it back in the parent, which is where the exit status is decided.
+ACTFLAG="${TMPDIR:-/tmp}/.rig-act.$$"
+rm -f "$ACTFLAG"
+trap 'rm -f "$ACTFLAG"' EXIT
+act() { RC=1; : > "$ACTFLAG"; }
+rc_final() { [[ -e "$ACTFLAG" ]] && return 1; return $RC; }
+PENDING=0                 # dry run only: changes rig WOULD make
+pend() { PENDING=$((PENDING+1)); }
+
+# --- roster -----------------------------------------------------------------
+# key=value stanzas opened by a `box=` line. Grep-parsed, never sourced.
+# Later files override earlier ones per (box, key), so boxes.local.conf can
+# carry an untracked per-box tweak without editing shared data.
+conf_files() { local f; for f in "$BOXES" "$LOCALCONF"; do [[ -r "$f" ]] && printf '%s\n' "$f"; done; }
+have_roster() { [[ -n "$(conf_files)" ]]; }
+
+roster() {
+  have_roster || return 1
+  local f
+  for f in $(conf_files); do grep -h '^box=' "$f" 2>/dev/null | cut -d= -f2-; done \
+    | grep -vx '@defaults' | awk '!seen[$0]++'
+}
+
+# bget BOX KEY [DEFAULT] — that box's value, else @defaults', else DEFAULT.
+bget() {
+  local box="$1" key="$2" dflt="${3:-}" f v=""
+  for f in $(conf_files); do
+    local got
+    got="$(awk -v b="$box" -v k="$key" '
+      /^box=/ { cur = substr($0, 5); next }
+      cur == b && index($0, k "=") == 1 { print substr($0, length(k) + 2) }' "$f" | tail -1)"
+    [[ -n "$got" ]] && v="$got"
+  done
+  if [[ -z "$v" ]]; then
+    for f in $(conf_files); do
+      local got
+      got="$(awk -v k="$key" '
+        /^box=/ { cur = substr($0, 5); next }
+        cur == "@defaults" && index($0, k "=") == 1 { print substr($0, length(k) + 2) }' "$f" | tail -1)"
+      [[ -n "$got" ]] && v="$got"
+    done
+  fi
+  printf '%s' "${v:-$dflt}"
+}
+
+THISBOX="${RIG_BOX:-$(hostname -s)}"
+in_roster() { roster 2>/dev/null | grep -qx -- "$1"; }
+
+# With no roster, repos are discovered rather than declared, so bare `rig` is
+# useful on a box that has never been registered. Never refuse for missing data.
+discover_repos() {
+  local d real out="" seen="" n=0
+  for d in "$HOME"/*/ "${XDG_CONFIG_HOME:-$HOME/.config}"/*/; do
+    [[ -d "$d/.git" ]] || continue
+    git -C "$d" config --get "branch.$(git -C "$d" symbolic-ref --short HEAD 2>/dev/null).remote" \
+      >/dev/null 2>&1 || continue
+    # Dedup by real path: a dots repo reached through a symlinked alias is one
+    # repo, not two. A repo puller should do the same for the same reason.
+    real="$(readlink -f "${d%/}")"
+    case " $seen " in *" $real "*) continue ;; esac
+    seen+="$real "
+    out+="${d%/} "
+    n=$((n+1)); [[ $n -ge 12 ]] && break
+  done
+  printf '%s' "${out% }"
+}
+
+repos_for() { local b="$1"; local r; r="$(bget "$b" repos "")"
+              [[ -n "$r" ]] && { printf '%s' "$r"; return; }
+              discover_repos; }
+
+# --- art --------------------------------------------------------------------
+#   ━ heavy   durable: a remote, a box that persists
+#   ─ light   ephemeral: a check, a stage in flight
+#   ● landed  ◆ this box   ◇ elsewhere
+#   → becomes (before into after)      ▶ destination
+# Each banner carries the real counts, like wt's do: a picture that says the
+# same thing on every run is decoration, and decoration on a command you type
+# fifty times a day is noise.
+
+art_here() { # box nrepos ntimers
+  art_on || return 0
+  printf '\n'
+  printf '%s\n' "        ${C_PATH}◇${C_0} ${C_DIM}origin${C_0}"
+  printf '%s\n' "    ${C_DIM}━━●━${C_MINE}┿${C_DIM}━━━━━━${C_OK}▶${C_0}   ${C_MINE}${1}${C_0}   ${C_DIM}${2} repo(s) · ${3} timer(s)${C_0}"
+  printf '%s\n' "        ${C_MINE}◆${C_0} ${C_DIM}this box${C_0}"
+  printf '\n'
+}
+
+art_status() { # nboxes
+  art_on || return 0
+  printf '\n'
+  printf '%s\n' "         ${C_DIM}╭─${C_PATH}◇${C_0}"
+  printf '%s\n' "    ${C_MINE}◆${C_DIM}━━━${C_MINE}┿${C_DIM}─${C_PATH}◇${C_0}   ${C_DIM}reading ${1} box(es), no box written to${C_0}"
+  printf '%s\n' "         ${C_DIM}╰─${C_PATH}◇${C_0}"
+  printf '\n'
+}
+
+art_sync_stages() { # dry
+  art_on || return 0
+  local tail="applying"; [[ "${1:-0}" == 1 ]] && tail="dry run, nothing applied"
+  printf '\n'
+  printf '%s\n' "    ${C_DIM}●─${C_0}${C_MINE}●${C_DIM}─${C_0}${C_MINE}●${C_DIM}─${C_0}${C_MINE}●${C_DIM}─${C_0}${C_MINE}●${C_DIM}─${C_0}${C_MINE}●${C_0}   ${C_DIM}repos journal links dots timers verify${C_0}"
+  printf '%s\n' "                  ${C_DIM}${tail}${C_0}"
+  printf '\n'
+}
+
+art_fleet() { # nboxes dry
+  art_on || return 0
+  local tail="one at a time, writes"; [[ "${2:-0}" == 1 ]] && tail="one at a time, dry run"
+  printf '\n'
+  printf '%s\n' "    ${C_MINE}◆${C_0} ${C_OK}━▶${C_0} ${C_PATH}◇${C_0} ${C_OK}━▶${C_0} ${C_PATH}◇${C_0}   ${C_DIM}${1} box(es) · ${tail}${C_0}"
+  printf '\n'
+}
+
+art_doctor() { # disk
+  art_on || return 0
+  local tail="probe · roster · installers · links · timers"
+  [[ "${1:-0}" == 1 ]] && tail+=" · disk"
+  printf '\n'
+  printf '%s\n' "    ${C_DIM}●───●───●${C_0}   ${C_DIM}${tail}${C_0}"
+  printf '%s\n' "    ${C_DIM}read only — names the fix, never applies it${C_0}"
+  printf '\n'
+}
+
+art_boxes() { # nboxes
+  art_on || return 0
+  printf '\n'
+  printf '%s\n' "    ${C_DIM}┏━${C_MINE}◆${C_DIM}━┓${C_0} ${C_DIM}the roster${C_0}   ${C_DIM}${1} box(es) declared${C_0}"
+  printf '\n'
+}
+
+# --- the fleet, as this box defines it --------------------------------------
+# Derived from the `# sc-fleet` markers rather than listed, exactly as
+# the installer derives what to link. That is what makes "is the
+# fleet installed over there" a question with an automatic answer.
+fleet_expected() {
+  local f out=""
+  for f in "$(dirname "$SELF")"/*; do
+    [[ -f "$f" && -x "$f" ]] || continue
+    local n="${f##*/}"
+    [[ "$n" == sc ]] || grep -qm1 '^# sc-fleet' "$f" 2>/dev/null || continue
+    out+="$n "
+  done
+  printf '%s' "${out% }"
+}
+
+# What a probed box actually has, from its reported ~/.local/bin listing.
+fleet_missing() {   # <probe file>
+  local file="$1" have want miss=""
+  have=",$(pget "$file" bin),"
+  want="$(fleet_expected)"
+  local n
+  for n in $want; do
+    [[ "$have" == *",$n,"* ]] || miss+="$n "
+  done
+  printf '%s' "${miss% }"
+}
+
+# --- probing ----------------------------------------------------------------
+probe_local() {
+  local b="$THISBOX"
+  bash "$PROBE" "$(repos_for "$b")" "$(bget "$b" mounts "")" \
+       "$(bget "$b" timers "")" 2>/dev/null
+}
+
+# probe_remote BOX ALIAS OUTFILE ERRFILE RCFILE
+probe_remote() {
+  local b="$1" alias="$2" out="$3" err="$4" rcf="$5"
+  # ssh joins its command words into ONE string that the remote shell then
+  # re-splits, so a space-separated list passed as a single argument arrives
+  # as several. The first real cross-box run showed exactly that: the repo
+  # list spilled into the mounts and timers arguments, and a repo was
+  # rendered as a mount. Pre-quote each argument for that second parse.
+  local qr qm qt
+  qr="$(printf '%q' "$(repos_for "$b")")"
+  qm="$(printf '%q' "$(bget "$b" mounts "")")"
+  qt="$(printf '%q' "$(bget "$b" timers "")")"
+  timeout -k 2 "$TIMEOUT" \
+    ssh -o BatchMode=yes -o ConnectTimeout=4 -o ServerAliveInterval=5 \
+        -o ServerAliveCountMax=2 -o ControlPath=none -o LogLevel=ERROR \
+        ${RIG_SSH_OPTS:-} "$alias" \
+        "/bin/bash -s -- $qr $qm $qt" \
+    < "$PROBE" > "$out" 2> "$err"
+  printf '%s' "$?" > "$rcf"
+}
+
+pget()  { sed -n "s/^$2=//p" "$1" | tail -1; }         # scalar key
+plines(){ grep "^$2=" "$1" 2>/dev/null || true; }      # repeated key
+kv()    { sed -n "s/.*[[:space:]]$2=\([^[:space:]]*\).*/\1/p" <<<"$1" | head -1; }
+
+# --- freshness, computed on the caller --------------------------------------
+# The probe never fetches, because fetching writes. We fetch once here and do
+# the ancestry arithmetic locally against our own object store.
+FETCHED=""
+fetch_once() {
+  local d="$1"
+  [[ -d "$d/.git" || -f "$d/.git" ]] || return 1
+  case " $FETCHED " in *" $d "*) return 0 ;; esac
+  git -C "$d" fetch -q --all 2>/dev/null || true
+  FETCHED+="$d "
+}
+
+# verdict LOCALREPO SHA UPSTREAMREF -> level | ahead N | behind N | unpushed | ?
+verdict() {
+  local d="$1" sha="$2" upref="$3"
+  [[ -n "$sha" && "$sha" != "-" ]] || { printf '?'; return; }
+  [[ -d "$d/.git" || -f "$d/.git" ]] || { printf '?'; return; }
+  local tip; tip="$(git -C "$d" rev-parse "$upref" 2>/dev/null)" || { printf '?'; return; }
+  [[ -n "$tip" ]] || { printf '?'; return; }
+  git -C "$d" cat-file -e "$sha^{commit}" 2>/dev/null || { printf 'unpushed'; return; }
+  if [[ "$sha" == "$tip" ]]; then printf 'level'; return; fi
+  if git -C "$d" merge-base --is-ancestor "$sha" "$tip" 2>/dev/null; then
+    printf 'behind %s' "$(git -C "$d" rev-list --count "$sha..$tip" 2>/dev/null)"
+  elif git -C "$d" merge-base --is-ancestor "$tip" "$sha" 2>/dev/null; then
+    printf 'ahead %s' "$(git -C "$d" rev-list --count "$tip..$sha" 2>/dev/null)"
+  else
+    printf 'diverged'
+  fi
+}
+
+colour_verdict() {
+  case "$1" in
+    level)      ok "$1" ;;
+    ahead*)     printf '%s' "$(dim "$1")" ;;
+    behind*)    printf '%s' "$(bad "$1")" ;;
+    diverged)   act; printf '%s' "$(bad "$1")" ;;
+    unpushed)   printf '%s' "$(dim "$1 — only on that box")" ;;
+    *)          dim "$1" ;;
+  esac
+}
+
+# --- rendering one box ------------------------------------------------------
+render_box() {
+  local file="$1" label="$2" local_box="$3"
+  local host os kernel hfs sysd linger
+  host="$(pget "$file" host)"; os="$(pget "$file" os)"; kernel="$(pget "$file" kernel)"
+  hfs="$(pget "$file" home_fs)"; sysd="$(pget "$file" systemd_user)"
+  linger="$(pget "$file" linger)"
+
+  brow "$label" "$os · ${kernel%%-*} · home on $hfs" \
+    "$( [[ "$host" == "$label" || -z "$host" ]] && ok ok || bad "reports host=$host" )"
+
+  # repos
+  local line r verd real sha upname dirty mid
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    r="$(sed -n 's/^repo=\([^ ]*\).*/\1/p' <<<"$line")"
+    if grep -q 'state=absent' <<<"$line"; then
+      brow "  $r" "$(dim 'not checked out here')" "$(dim absent)"; continue
+    fi
+    sha="$(kv "$line" head)"; upname="$(kv "$line" upname)"
+    dirty="$(kv "$line" dirty)"; mid="$(kv "$line" midop)"
+    real="${r/#\~/$HOME}"
+    if [[ $local_box -eq 1 ]]; then fetch_once "$real"; fi
+    verd="$(verdict "$real" "$sha" "$upname")"
+    local note; note="$(colour_verdict "$verd")"
+    [[ "$dirty" != 0 && -n "$dirty" ]] && note+=" $(dim "· $dirty dirty")"
+    if [[ "$mid" == yes ]]; then note+=" $(bad '· MID-OPERATION')"; act; fi
+    brow "  $(shortlabel "$r")" "$(kv "$line" branch) → ${upname}" "$note"
+  done < <(plines "$file" repo)
+
+  # mounts the roster said should be here
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    local m p
+    m="$(sed -n 's/^mount=\([^ ]*\).*/\1/p' <<<"$line")"; p="$(kv "$line" present)"
+    brow "  $m" "$(dim 'declared in the roster')" \
+      "$( [[ "$p" == yes ]] && ok present || { act; bad 'MISSING on this box'; } )"
+  done < <(plines "$file" mount)
+
+  # timers
+  if [[ "$sysd" == yes ]]; then
+    local now; now="$(pget "$file" epoch)"; [[ -n "$now" ]] || now="$(date +%s)"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      local t en ac res last agehr
+      t="$(sed -n 's/^timer=\([^ ]*\).*/\1/p' <<<"$line")"
+      en="$(kv "$line" enabled)"; ac="$(kv "$line" active)"
+      res="$(kv "$line" result)"; last="$(kv "$line" last)"
+      if [[ "$en" != enabled ]]; then
+        brow "  timer $t" "$(dim "enabled=$en active=$ac")" \
+          "$(bad "not enabled — $(base "${TIMER_INSTALL:-the timer installer}")")"; act
+      elif [[ "$res" != success && -n "$res" && "$res" != '?' ]]; then
+        brow "  timer $t" "$(dim "last result=$res")" "$(bad 'last run failed')"; act
+      else
+        agehr='?'
+        [[ -n "$last" && "$last" != 0 ]] && agehr=$(( (now - last) / 3600 ))
+        brow "  timer $t" "$(dim "last ran ${agehr}h ago")" "$(ok ok)"
+      fi
+    done < <(plines "$file" timer)
+    local fu; fu="$(pget "$file" failed_units)"
+    if [[ -n "$fu" && "$fu" != 0 ]]; then
+      brow "  units" "$(dim "$fu failed")" "$(bad 'systemctl --user --failed')"; act
+    fi
+  else
+    brow "  scheduler" "$(dim 'no systemd user manager')" \
+      "$(dim "cron lines: $(pget "$file" cron_lines)")"
+  fi
+
+  # is the fleet actually installed there
+  local miss; miss="$(fleet_missing "$file")"
+  local nfleet; nfleet="$(wc -w <<<"$(fleet_expected)")"
+  if [[ -z "$miss" ]]; then
+    brow "  fleet" "$(dim "$nfleet tool(s)")" "$(ok installed)"
+  else
+    brow "  fleet" "$(bad "missing: $miss")" "$(bad 'not set up — rig sync there')"; act
+  fi
+
+  # capacity, since a full disk and a memory reap are what prompted this tool
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    local sp av
+    sp="$(sed -n 's/^space=\([^ ]*\).*/\1/p' <<<"$line")"; av="$(kv "$line" avail_mb)"
+    [[ -n "$av" ]] || continue
+    brow "  space $(shortlabel "$sp")" "$(dim "$(( av / 1024 )) GB free")" \
+      "$( [[ "$av" -lt 2048 ]] && { act; bad LOW; } || ok ok )"
+  done < <(plines "$file" space)
+  local mt ma
+  mt="$(pget "$file" mem_total_mb)"; ma="$(pget "$file" mem_avail_mb)"
+  if [[ -n "$mt" && -n "$ma" ]]; then
+    brow "  memory" "$(dim "$(( ma / 1024 )) of $(( mt / 1024 )) GB available")" \
+      "$( [[ "$ma" -lt 1024 ]] && { act; bad LOW; } || ok ok )"
+  fi
+}
+
+# --- verbs ------------------------------------------------------------------
+cmd_here() {
+  local f="$RUN/local.$$"; mkdir -p "$RUN"
+  probe_local > "$f"
+  if ! grep -qx 'end=ok' "$f"; then
+    rm -f "$f"; die "the local probe did not finish — run bash $PROBE by hand to see why"
+  fi
+  art_here "$THISBOX" "$(grep -c '^repo=' "$f")" "$(grep -c '^timer=' "$f")"
+  have_roster || brow roster "${BOXES/#$HOME/\~}" "$(dim 'absent — repos discovered, not declared')"
+  in_roster "$THISBOX" || brow "$THISBOX" "$(dim 'not in the roster')" "$(dim 'rig boxes --stanza')"
+  render_box "$f" "$THISBOX" 1
+  rm -f "$f"
+  rc_final
+}
+
+cmd_status() {
+  local all=0
+  [[ "${1:-}" == "-a" || "${1:-}" == "--all" ]] && all=1
+  if [[ $all -eq 0 ]]; then cmd_here; return $?; fi
+  have_roster || { brow roster "${BOXES/#$HOME/\~}" "$(dim 'absent — this box only')"; cmd_here; return $?; }
+
+  art_status "$(roster | wc -l | tr -d ' ')"
+  local d="$RUN/status.$$"; mkdir -p "$d"
+  local jobs=0 box alias
+  while read -r box; do
+    [[ -n "$box" ]] || continue
+    if [[ "$box" == "$THISBOX" ]]; then
+      probe_local > "$d/$box.out"; printf 0 > "$d/$box.rc"; continue
+    fi
+    if [[ "$(bget "$box" own yes)" == no && -z "${RIG_INCLUDE_UNOWNED:-}" ]]; then
+      printf 'unowned\n' > "$d/$box.skip"; continue
+    fi
+    alias="$(bget "$box" ssh "")"
+    [[ -n "$alias" ]] || { printf 'no-alias\n' > "$d/$box.skip"; continue; }
+    ( probe_remote "$box" "$alias" "$d/$box.out" "$d/$box.err" "$d/$box.rc" ) &
+    jobs=$((jobs+1))
+    [[ $jobs -ge $PAR ]] && { wait -n 2>/dev/null || true; jobs=$((jobs-1)); }
+  done < <(roster)
+  wait 2>/dev/null || true
+
+  while read -r box; do
+    [[ -n "$box" ]] || continue
+    if [[ -f "$d/$box.skip" ]]; then
+      brow "$box" "$(dim "$(cat "$d/$box.skip")")" \
+        "$(dim "$( [[ "$(cat "$d/$box.skip")" == unowned ]] && echo 'not ours — RIG_INCLUDE_UNOWNED=1 to probe' || echo 'registry-only' )")"
+      continue
+    fi
+    local rc; rc="$(cat "$d/$box.rc" 2>/dev/null || echo 255)"
+    if [[ "$rc" != 0 ]] || ! grep -qx 'end=ok' "$d/$box.out" 2>/dev/null; then
+      local why
+      if [[ "$rc" == 0 ]]; then why='truncated — ssh died mid-stream'
+      else case "$rc" in
+        124) why="timeout ${TIMEOUT}s" ;;
+        255) why="unreachable — $(head -1 "$d/$box.err" 2>/dev/null | cut -c1-40)" ;;
+        *)   why="probe rc=$rc" ;;
+      esac; fi
+      brow "$box" "$(dim "$why")" "$(dim transient)"
+      continue
+    fi
+    if grep -q '^probe_error=' "$d/$box.out"; then
+      brow "$box" "$(bad "$(grep -m1 '^probe_error=' "$d/$box.out")")" "$(bad 'probe refused')"; act
+      continue
+    fi
+    render_box "$d/$box.out" "$box" "$([[ "$box" == "$THISBOX" ]] && echo 1 || echo 0)"
+    printf '\n'
+  done < <(roster)
+  rm -rf "$d"
+  rc_final
+}
+
+# A paste-ready stanza. The roster is the one thing a new server needs, so
+# producing a correct stanza must be easier than remembering the key names.
+stanza_for() {
+  local name="${1:-$THISBOX}"
+  printf '\n# added %s\n' "$(date +%F)"
+  printf 'box=%s\n' "$name"
+  printf 'ssh=%s          # the alias or hostname THIS box reaches it by\n' "$name"
+  printf 'role=           # dev | prod | jump | worker | desktop\n'
+  printf 'own=yes         # no  -> never written to, and skipped by status -a\n'
+  printf 'profile=work    # work | personal, for the dots installer\n'
+  printf '#mounts=        # paths that must exist there\n'
+  printf '#timers=        # override the expected set; empty means none\n'
+  printf '#note=          # one line for a human\n'
+}
+
+cmd_boxes() {
+  case "${1:-}" in
+    --stanza) stanza_for "${2:-}"; return 0 ;;
+    --add)
+      [[ -n "${2:-}" ]] || die "--add needs a box name"
+      in_roster "$2" && die "$2 is already in ${BOXES/#$HOME/\~}"
+      [[ -w "$BOXES" ]] || [[ ! -e "$BOXES" && -w "$(dirname "$BOXES")" ]] ||
+        die "cannot write ${BOXES/#$HOME/\~} — rig boxes --stanza $2 and paste it in"
+      stanza_for "$2" >> "$BOXES"
+      row added "$2" "$(ok "appended to ${BOXES/#$HOME/\~}")"
+      row next "fill role= and check ssh=" "$(dim "then: rig status -a")"
+      cmd_boxes --lint
+      return $?
+      ;;
+  esac
+  have_roster || die "no roster at ${BOXES/#$HOME/\~} — create it, or rig boxes --stanza for a starting stanza"
+  art_boxes "$(roster | wc -l | tr -d ' ')"
+  local box
+  while read -r box; do
+    [[ -n "$box" ]] || continue
+    brow "$box" "$(dim "$(bget "$box" role '?') · $(bget "$box" ssh 'no alias')")" \
+      "$( [[ "$(bget "$box" own yes)" == no ]] && dim 'not ours' || ok mine )"
+  done < <(roster)
+  if [[ "${1:-}" == "--lint" ]]; then
+    printf '\n'
+    # The roster may sit in a public repo: catch what must not be in it.
+    local hits f
+    for f in $(conf_files); do
+      hits="$(grep -nE '([0-9]{1,3}\.){3}[0-9]{1,3}|[A-Za-z0-9_-]+\.[A-Za-z]{2,}' "$f" \
+              | grep -vE '^[0-9]*:(mounts|repos|push|bootstrap_repo|bootstrap)=' | grep -v '^[0-9]*:#' || true)"
+      if [[ -n "$hits" ]]; then
+        row lint "${f/#$HOME/\~}" "$(bad 'IP or dotted name outside the path keys')"
+        printf '%s\n' "$hits" | sed 's/^/           /'
+        act
+      else
+        row lint "${f/#$HOME/\~}" "$(ok 'no addresses leaked')"
+      fi
+    done
+  fi
+  rc_final
+}
+
+# --- the installers this box already has ------------------------------------
+# Named by config, never assumed: each is a path in ~/.config/sc-fleet/config,
+# empty (stage skipped) when unset. The dots repo is derived from where
+# ~/.zshrc points, which is site-free and correct under any name.
+CONFIG_PULL="$(sc_conf rig.pull "")"           # fast-forwards the box's repos
+PULL_LOG="$(sc_conf rig.pull_log "")"          # where it logs DIVERGED lines
+JOURNAL_SYNC="$(sc_conf rig.journal "")"       # commits and syncs a journal repo
+JOURNAL_REPO="${RIG_JOURNAL:-$(sc_conf rig.journal_repo "")}"   # the repo it owns
+SETUP_SERVER="$(sc_conf rig.installer "")"     # link installer with a --check mode
+TIMER_INSTALL="$(sc_conf rig.timer_installer "")"
+CRON_INSTALL="$(sc_conf rig.cron_installer "")"
+base() { printf '%s' "${1##*/}"; }
+
+# What doctor delegates to. Located, with an env override so the test suite
+# can point each at a stub without redirecting HOME. ~/.local/bin is tried by
+# hand because a non-interactive shell may not have it on PATH.
+DYE_BIN="${RIG_DYE:-$(command -v dye 2>/dev/null || true)}"
+[[ -z "$DYE_BIN" && -x "$HOME/.local/bin/dye" ]] && DYE_BIN="$HOME/.local/bin/dye"
+AGE_BIN="${RIG_AGE:-$(command -v age 2>/dev/null || true)}"
+[[ -z "$AGE_BIN" && -x "$HOME/.local/bin/age" ]] && AGE_BIN="$HOME/.local/bin/age"
+# The dotfiles-secrets identity. NOT ~/.config/age/keys.txt: that name is the
+# vault-backup key, which belongs on almost no box; this one belongs on all.
+SECRETS_ID="${RIG_SECRETS_ID:-${XDG_CONFIG_HOME:-$HOME/.config}/age/dotfiles.key}"
+SECRETS_OUT="${RIG_SECRETS_OUT:-$HOME/.zsh_secrets}"
+DISK_LIB="$LIBDIR/rig-disk.sh"
+DISK_BUDGET="${RIG_DISK_BUDGET:-300}"
+
+dots_repo() {
+  [[ -n "${RIG_DOTS:-}" ]] && { printf '%s' "$RIG_DOTS"; return 0; }
+  local rc; rc="$(readlink -f "$HOME/.zshrc" 2>/dev/null)" || return 1
+  [[ -n "$rc" ]] || return 1
+  local d; d="$(git -C "$(dirname "$rc")" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  printf '%s' "$d"
+}
+
+# --- doctor rows that delegate ---------------------------------------------
+# The editor stack is the dots repo's own check, run here so one exit code
+# answers the whole question. Gaps ARE findings in doctor: the script is
+# interactive, so nothing unattended can close them — which is exactly why
+# sync reports them as a note and doctor as something a human must do.
+doctor_editor() { # DOTS_REPO
+  local dr="$1" es="$1/install-editor-stack.sh"
+  if [[ -z "$dr" || ! -x "$es" ]]; then
+    row editor "$(dim 'no install-editor-stack.sh in the dots')" "$(dim skipped)"; return
+  fi
+  local out rc; out="$(bash "$es" --check 2>&1)"; rc=$?
+  if [[ $rc -eq 0 ]]; then row editor "install-editor-stack --check" "$(ok clean)"; return; fi
+  local pat='^ {2}\S.*\b(MISSING|BROKEN|STALE-OR-UNKNOWN)\b'
+  local n; n="$(grep -cE "$pat" <<<"$out")"
+  if [[ "$n" -eq 0 ]]; then
+    row editor "$(bad "install-editor-stack rc=$rc")" "$(bad 'died before its verdict — run it by hand')"; act; return
+  fi
+  row editor "install-editor-stack --check" "$(bad "$n gap(s) — run it by hand, it asks")"
+  grep -E "$pat" <<<"$out" | sed 's/^ *//; s/^/           /'
+  act
+}
+
+# Theme drift is dye's question. Its summary line is the contract: the count
+# of FAIL rows, exit 1 when non-zero. A box that never adopted dye is not a
+# broken box, so absence is a skip; a dye that dies before its summary is not.
+doctor_theme() {
+  if [[ -z "$DYE_BIN" || ! -x "$DYE_BIN" ]]; then
+    row theme "$(dim 'dye not installed')" "$(dim 'skipped — dye install')"; return
+  fi
+  local out rc sum
+  out="$(NO_COLOR=1 timeout -k 2 60 "$DYE_BIN" doctor 2>&1)"; rc=$?
+  sum="$(grep -E '^doctor: (clean|[0-9]+ finding\(s\))$' <<<"$out" | tail -1)"
+  if [[ $rc -eq 0 && "$sum" == 'doctor: clean' ]]; then
+    row theme "dye doctor" "$(ok clean)"
+  elif [[ "$sum" =~ ^doctor:\ ([0-9]+)\ finding ]]; then
+    row theme "dye doctor" "$(bad "${BASH_REMATCH[1]} finding(s) — dye doctor")"
+    grep -E '^ {2}\S+ +FAIL( |$)' <<<"$out" | sed 's/^ *//; s/^/           /' | head -8
+    act
+  else
+    row theme "$(bad "dye doctor rc=$rc")" "$(bad 'died before its summary — run it by hand')"; act
+  fi
+}
+
+# The sealed ~/.zsh_secrets: is this box able to open the blob the dots carry,
+# and is its copy current? First failing state wins, one row, and every state
+# names the one command that fixes it. Locals in the parent shell, like the
+# timers block, so PIPESTATUS can tell "age refused" from "content differs".
+# Nothing here prints plaintext or the identity; a public key is safe.
+doctor_secrets() { # DOTS_REPO
+  local dr="$1"
+  local blob="${RIG_SECRETS_BLOB:-$dr/secrets/zsh_secrets.age}"
+  local rcpt="${RIG_SECRETS_RECIPIENTS:-$dr/secrets/recipients.txt}"
+  if [[ -z "$dr" || ( ! -f "$blob" && ! -f "$rcpt" ) ]]; then
+    row secrets "$(dim 'none sealed in the dots')" "$(dim skipped)"; return
+  fi
+  local id="$SECRETS_ID" out="$SECRETS_OUT"
+  if [[ -z "$AGE_BIN" || ! -x "$AGE_BIN" ]]; then
+    row secrets "$(bad 'age not installed')" "$(bad 'bootstrap.sh has the snippet')"; act; return
+  fi
+  local keygen; keygen="$(dirname "$AGE_BIN")/age-keygen"
+  [[ -x "$keygen" ]] || keygen="$(command -v age-keygen 2>/dev/null || true)"
+  if [[ ! -f "$id" ]]; then
+    row secrets "$(bad "no identity at $(shortlabel "$id" 30)")" "$(bad 'age-keygen -o it; add its public key to recipients; re-seal')"; act; return
+  fi
+  local mode; mode="$(stat -c %a "$id" 2>/dev/null)"
+  if [[ "$mode" != 600 ]]; then
+    row secrets "$(bad "identity is mode $mode")" "$(bad "chmod 600 $(shortlabel "$id" 30)")"; act; return
+  fi
+  local n pub; n="$(grep -c '^age1' "$rcpt" 2>/dev/null || true)"; n="${n:-0}"
+  pub="$( [[ -x "$keygen" ]] && "$keygen" -y "$id" 2>/dev/null || true )"
+  if [[ -z "$pub" ]]; then
+    row secrets "$(bad 'identity unreadable')" "$(bad 'age-keygen -y refused it — regenerate')"; act; return
+  fi
+  if ! grep -qxF -- "$pub" "$rcpt" 2>/dev/null; then
+    row secrets "$(bad 'this box is not a recipient')" "$(bad 'append its public key to recipients and re-seal')"
+    printf '           %s\n' "$pub"; act; return
+  fi
+  if [[ ! -f "$blob" ]]; then
+    row secrets "$(bad 'no blob')" "$(bad 'seal on the box whose ~/.zsh_secrets is current')"; act; return
+  fi
+  if [[ ! -f "$out" ]]; then
+    row secrets "$(bad "$(shortlabel "$out" 30) not decrypted")" "$(bad 'install.sh writes it')"; act; return
+  fi
+  mode="$(stat -c %a "$out" 2>/dev/null)"
+  if [[ "$mode" != 600 ]]; then
+    row secrets "$(bad "$(shortlabel "$out" 30) is mode $mode")" "$(bad 'chmod 600')"; act; return
+  fi
+  "$AGE_BIN" -d -i "$id" "$blob" 2>/dev/null | cmp -s - "$out"
+  local st=("${PIPESTATUS[@]}")
+  if [[ ${st[0]} -ne 0 ]]; then
+    row secrets "$(bad 'blob does not open with this identity')" "$(bad 're-seal with this box listed')"; act; return
+  fi
+  if [[ ${st[1]} -ne 0 ]]; then
+    row secrets "$(bad "$(shortlabel "$out" 30) is stale")" "$(bad 'install.sh refreshes it')"; act; return
+  fi
+  row secrets "sealed · $n recipient(s)" "$(ok 'this box listed · current')"
+}
+
+# --disk: the du triage that lived as a one-off script on one box. Local
+# only — doctor is local, and the raw traversal and report are writes that
+# belong under this box's own state dir, never shipped over ssh. Roots are
+# the roster's mounts plus home and /tmp, or the one path you name.
+doctor_disk() { # [PATH]
+  local want="${RIG_DISK_PATHS:-}"
+  if [[ -z "$want" ]]; then
+    if [[ -n "${1:-}" ]]; then want="$1"
+    else want="$(bget "$THISBOX" mounts "") $HOME /tmp"; fi
+  fi
+  if [[ ! -r "$DISK_LIB" ]]; then
+    row disk "$(bad 'lib/rig-disk.sh missing')" "$(bad 'the fleet is half-installed')"; act; return
+  fi
+  local outdir="$STATE/disk"; mkdir -p "$outdir" "$RUN"
+  local r real seen=" " f line av part note
+  for r in $want; do
+    r="${r/#\~/$HOME}"
+    [[ -d "$r" ]] || { row disk "$(shortlabel "$r" 42)" "$(dim 'not a directory here — skipped')"; continue; }
+    real="$(readlink -f "$r")"
+    case "$seen" in *" $real "*) continue ;; esac
+    seen+="$real "
+    f="$RUN/disk.$$"
+    bash "$DISK_LIB" "$real" "$outdir" "$DISK_BUDGET" > "$f" 2>/dev/null
+    if ! grep -qx 'end=ok' "$f"; then
+      row disk "$(shortlabel "$r" 42)" "$(bad 'triage did not finish — run lib/rig-disk.sh by hand')"; act; continue
+    fi
+    av="$(pget "$f" avail_mb)"; part="$(pget "$f" partial)"
+    note="$(dim "$(( ${av:-0} / 1024 )) GB free · $(pget "$f" dirs) dir(s) · $(pget "$f" elapsed)s")"
+    if [[ -n "$av" && "$av" -lt 2048 ]]; then
+      note="$(bad "LOW — $( [[ $av -lt 1024 ]] && printf '%s MB' "$av" || printf '%s GB' "$(( av / 1024 ))" ) free")"; act
+    fi
+    [[ "$part" == yes ]] && note+=" $(bad 'PARTIAL — raise RIG_DISK_BUDGET')"
+    row disk "$(shortlabel "$r" 42)" "$note"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      row "  top" "$(shortlabel "${line#* }" 42)" "$(dim "$(human_b "${line%% *}")")"
+    done < <(plines "$f" top1 | sed 's/^top1=//'; plines "$f" top2 | sed 's/^top2=//')
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      row "  junk" "$(kv "$line" label)" "$(dim "$(human_b "$(kv "$line" total)") · $(kv "$line" n) dir(s)")"
+    done < <(plines "$f" junk)
+    row "  report" "$(shortlabel "$(pget "$f" report)" 42)" "$(dim "zcat $(shortlabel "$(pget "$f" raw)" 30)")"
+    rm -f "$f"
+  done
+}
+
+cmd_doctor() {
+  local disk=0 dpath=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --disk) disk=1; if [[ $# -ge 2 && "${2:0:1}" != "-" ]]; then dpath="$2"; shift; fi ;;
+      *)      die "doctor: unknown option $1 (--disk [path])" ;;
+    esac
+    shift
+  done
+  art_doctor "$disk"
+  row probe "${PROBE/#$HOME/\~}" \
+    "$( [[ -r "$PROBE" ]] && ok ok || { act; bad 'missing — the fleet is half-installed'; } )"
+  row roster "${BOXES/#$HOME/\~}" \
+    "$( have_roster && ok "$(roster | wc -l | tr -d ' ') box(es)" || dim 'absent — local only, which is fine' )"
+  if have_roster; then
+    row "this box" "$THISBOX" \
+      "$( in_roster "$THISBOX" && ok 'in the roster' || { act; bad 'not in the roster — rig boxes --stanza'; } )"
+  fi
+
+  # Short labels rather than truncated basenames: `config-pu` tells a reader
+  # less than `pull` does, and the column is 22 wide for a reason.
+  local pair s l k
+  for pair in "pull:rig.pull:$CONFIG_PULL" "journal:rig.journal:$JOURNAL_SYNC" \
+              "installer:rig.installer:$SETUP_SERVER" "scheduler:rig.timer_installer:$TIMER_INSTALL"; do
+    l="${pair%%:*}"; k="${pair#*:}"; s="${k#*:}"; k="${k%%:*}"
+    if [[ -z "$s" ]]; then
+      row "$l" "$(dim "not configured ($k)")" "$(dim skipped)"; continue
+    fi
+    row "$l" "$(dim "$(shortlabel "$s")")" \
+      "$( [[ -x "$s" || -r "$s" ]] && ok present || { act; bad missing; } )"
+  done
+
+  local dr; dr="$(dots_repo || true)"
+  row dots "$( [[ -n "$dr" ]] && printf '%s' "${dr/#$HOME/\~}" || printf 'not resolved' )" \
+    "$( [[ -n "$dr" && -r "$dr/install.sh" ]] && ok 'install.sh present' \
+        || dim 'no install.sh — dotfile links unmanaged here' )"
+  doctor_editor "$dr"
+  doctor_theme
+  doctor_secrets "$dr"
+
+  # The manifest check IS the link-drift answer; do not re-derive it here.
+  if [[ -n "$SETUP_SERVER" && -r "$SETUP_SERVER" ]]; then
+    local out; out="$(bash "$SETUP_SERVER" --check 2>&1)"
+    if [[ $? -eq 0 ]]; then
+      row links "link manifest" "$(ok clean)"
+    else
+      row links "link manifest" "$(bad "$(grep -c '^\(MISSING\|WRONG\|NOTLINK\|ORPHAN\)' <<<"$out") gap(s) — rig sync")"
+      printf '%s\n' "$out" | grep '^\(MISSING\|WRONG\|NOTLINK\|ORPHAN\)' | sed 's/^/           /'
+      act
+    fi
+  fi
+
+  # Expected vs actual timers, which is the other thing no installer checks.
+  local want; want="$(bget "$THISBOX" timers "")"
+  if [[ -n "$want" ]]; then
+    if systemctl --user show-environment >/dev/null 2>&1; then
+      local t missing="" extra=""
+      for t in $want; do
+        systemctl --user is-enabled "$t.timer" >/dev/null 2>&1 || missing+="$t "
+      done
+      while read -r t; do
+        [[ -n "$t" ]] || continue
+        grep -qw -- "${t%.timer}" <<<"$want" || extra+="${t%.timer} "
+      done < <(systemctl --user list-unit-files --type=timer --no-legend 2>/dev/null | awk '{print $1}')
+      row timers "$(dim "$(wc -w <<<"$want") expected")" \
+        "$( [[ -z "$missing" ]] && ok 'all enabled' || { act; bad "missing: ${missing% }"; } )"
+      [[ -n "$extra" ]] && row "  extra" "$(dim "${extra% }")" "$(dim 'enabled here, not expected — reported, never disabled')"
+    else
+      row timers "$(dim 'no systemd user manager')" "$(dim 'cron fallback path')"
+    fi
+  fi
+  [[ $disk -eq 1 ]] && doctor_disk "$dpath"
+  rc_final
+}
+
+# `rig sync --fleet` — the one place rig writes to a box it is not sitting on.
+# It is a flag and never a default, it runs SEQUENTIALLY because these are
+# writes and a parallel mistake hits everything at once, a box marked own=no
+# is refused the same as locally, and a failure on one box never stops the
+# rest. Each box does its own local sync: the logic is not reimplemented
+# remotely, it is the same `rig sync` run over there.
+#
+# A box that does not have rig yet is BOOTSTRAPPED first, by running the
+# installer out of its own checkout (roster bootstrap_repo=, bootstrap=). That is exactly the state a
+# box is in the first time it is added.
+cmd_sync_fleet() {
+  local dry="$1"
+  have_roster || die "no roster at ${BOXES/#$HOME/\~} — nothing to iterate"
+  art_fleet "$(roster | wc -l | tr -d ' ')" "$dry"
+
+  local box alias dc rcb okc=0 failc=0 skipc=0
+  while read -r box; do
+    [[ -n "$box" ]] || continue
+
+    if [[ "$box" == "$THISBOX" ]]; then
+      row "$box" "this box" "$(dim 'local sync')"
+      cmd_sync $([[ $dry -eq 1 ]] && echo --dry-run) || act
+      printf '\n'; okc=$((okc+1)); continue
+    fi
+    if [[ "$(bget "$box" own yes)" == no ]]; then
+      row "$box" "$(dim 'own=no')" "$(dim 'refused — never written to')"; skipc=$((skipc+1)); continue
+    fi
+    alias="$(bget "$box" ssh "")"
+    if [[ -z "$alias" ]]; then
+      row "$box" "$(dim 'no ssh alias')" "$(dim 'registry-only')"; skipc=$((skipc+1)); continue
+    fi
+
+    dc="$(bget "$box" bootstrap_repo "")"
+    local boot; boot="$(bget "$box" bootstrap install.sh)"
+    # $HOME has to be expanded BY THE FAR SIDE, so the default (this checkout's
+    # path under $HOME) is emitted unquoted on purpose; an explicit roster path
+    # is quoted, because then it is literal text and the remote must not
+    # re-interpret it.
+    local remote
+    if [[ -z "$dc" ]]; then
+      remote="DC=\"\$HOME/$(printf '%s' "${RIG_ROOT#"$HOME"/}")\"; "
+    else
+      remote="DC=$(printf '%q' "$dc"); "
+    fi
+    remote+="BOOT=$(printf '%q' "$boot"); "
+    # NOT `command -v rig`: a non-interactive ssh shell has a minimal PATH
+    # with no ~/.local/bin, so that test reports "absent" for a tool that is
+    # installed and re-runs the whole bootstrap every time. Test the file and
+    # invoke it by absolute path.
+    remote+='R="$HOME/.local/bin/rig"; '
+    remote+='if [ -x "$R" ]; then "$R" sync'
+    [[ $dry -eq 1 ]] && remote+=' --dry-run'
+    remote+='; elif [ -r "$DC/$BOOT" ]; then '
+    if [[ $dry -eq 1 ]]; then
+      remote+='echo "would bootstrap: ff-only pull of $DC, then its $BOOT, then rig sync"; '
+    else
+      # Pull BEFORE installing: a box being bootstrapped is by definition
+      # behind, and its old installer would link only the tools it knew
+      # about. Fast-forward only, matching the repo puller's policy — a bootstrap
+      # must never be the thing that merges anything.
+      remote+='git -C "$DC" pull --ff-only -q 2>/dev/null; '
+      remote+='bash "$DC/$BOOT" >/dev/null 2>&1 && "$R" sync; '
+    fi
+    remote+='else echo "refuse    no checkout with $BOOT at $DC"; exit 1; fi'
+
+    # Ship the roster first. Every box has its own HOME, so without this the
+    # remote `rig sync` refuses for lack of a roster — which is exactly what
+    # the first real fleet run did. boxes.local.conf is NOT copied: it is the
+    # per-box override and belongs to that box.
+    if [[ $dry -eq 1 ]]; then
+      row "  roster" "$(dim 'would copy boxes.conf')" "$(dim 'each box has its own HOME')"
+    elif timeout -k 5 30 ssh -o BatchMode=yes -o ConnectTimeout=5 -o ControlPath=none \
+           -o LogLevel=ERROR ${RIG_SSH_OPTS:-} "$alias" \
+           'mkdir -p "$(dirname "${RIG_BOXES:-$HOME/.config/rig/boxes.conf}")" && cat > "${RIG_BOXES:-$HOME/.config/rig/boxes.conf}"' \
+           < "$BOXES" 2>/dev/null; then
+      row "  roster" "$(dim 'boxes.conf copied')" "$(ok ok)"
+    else
+      row "  roster" "$(bad 'could not copy the roster')" "$(bad 'that box will refuse')"
+    fi
+
+    row "$box" "$alias" "$(dim "$([[ $dry -eq 1 ]] && echo 'would sync' || echo 'syncing')")"
+    if timeout -k 5 "$(( TIMEOUT * 10 ))" \
+         ssh -o BatchMode=yes -o ConnectTimeout=5 -o ControlPath=none \
+             -o LogLevel=ERROR ${RIG_SSH_OPTS:-} "$alias" "$remote" 2>&1 \
+         | sed 's/^/           /'; then
+      okc=$((okc+1))
+    else
+      rcb=$?
+      row "  $box" "$(bad "sync rc=$rcb")" "$(bad 'that box needs a human')"
+      failc=$((failc+1)); act
+    fi
+    printf '\n'
+  done < <(roster)
+
+  row fleet "$okc ok · $skipc skipped · $failc failed" \
+    "$( [[ $failc -eq 0 ]] && ok ok || bad "$failc box(es) need a human" )"
+  rc_final
+}
+
+cmd_sync() {
+  local dry=0
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --dry-run) dry=1 ;;
+      --fleet)   : ;;
+      *) die "sync: unknown option $a (--dry-run, --fleet)" ;;
+    esac
+  done
+  # --fleet dispatches before any local preflight: the local box is just the
+  # first entry in the loop, not a precondition for reaching the others.
+  for a in "$@"; do [[ "$a" == --fleet ]] && { cmd_sync_fleet "$dry"; return $?; }; done
+
+  # Preflight. Note the asymmetry with status on purpose: READING with no
+  # roster degrades, WRITING with no roster refuses, because a write needs to
+  # know whose box this is.
+  have_roster || die "no roster at ${BOXES/#$HOME/\~} — rig boxes --stanza prints a starting stanza"
+  in_roster "$THISBOX" ||
+    die "$THISBOX is not in the roster; add this and re-run:
+$(cmd_boxes --stanza | sed 's/^/           /')"
+  [[ "$(bget "$THISBOX" own yes)" == no ]] &&
+    die "$THISBOX is marked own=no — rig never writes to a box that is not yours"
+  [[ "$(bget "$THISBOX" sched none)" == none && "$(bget "$THISBOX" timers x)" == "" ]] &&
+    die "$THISBOX is marked sched=none — nothing is scheduled here by policy"
+
+  mkdir -p "$RUN" "$STATE"
+  exec 9>"$RUN/sync.lock"
+  if ! flock -n 9; then
+    row lock "another rig sync holds it" "$(dim 'LOCKED — transient, exiting 0')"
+    return 0
+  fi
+
+  sc_band sync "$THISBOX$([[ $dry -eq 1 ]] && echo ' · dry run')"
+  art_sync_stages "$dry"
+
+  # Stage 1: repos, ff-only. Delegated verbatim; its DIVERGED classification
+  # and its exit contract are the ones rig reports.
+  local diverged=""
+  if [[ -n "$CONFIG_PULL" && -x "$CONFIG_PULL" ]]; then
+    if [[ $dry -eq 1 ]]; then
+      row repos "$(dim "would run $(base "$CONFIG_PULL")")" "$(dim 'dry run')"; pend
+    else
+      local cpout; cpout="$(bash "$CONFIG_PULL" 2>&1)"
+      local cprc=$?
+      if [[ $cprc -ne 0 ]]; then
+        diverged="$( { printf '%s\n' "$cpout"; [[ -n "$PULL_LOG" ]] && cat "$PULL_LOG" 2>/dev/null; } |
+                     grep -h 'DIVERGED' | tail -3)"
+        row repos "$(bad 'DIVERGED')" "$(bad 'resolve by hand; dependent stages skipped')"
+        [[ -n "$diverged" ]] && printf '%s\n' "$diverged" | sed 's/^/           /'
+        [[ -n "$diverged" ]] || diverged="yes"
+        act
+      else
+        row repos "$(base "$CONFIG_PULL") ff-only" "$(ok ok)"
+      fi
+    fi
+  else
+    row repos "$(dim "$( [[ -n "$CONFIG_PULL" ]] && printf '%s absent' "$(base "$CONFIG_PULL")" || printf 'not configured (rig.pull)')")" "$(dim skipped)"
+  fi
+
+  # Stage 2: the journal. Independent domain, so a failure is recorded and the
+  # sequence continues.
+  if [[ -n "$JOURNAL_SYNC" && -x "$JOURNAL_SYNC" ]]; then
+    if [[ $dry -eq 1 ]]; then
+      row journal "$(dim "would run $(base "$JOURNAL_SYNC")")" "$(dim 'dry run')"; pend
+    else
+      bash "$JOURNAL_SYNC" >/dev/null 2>&1 &&
+        row journal "commit · pull · push" "$(ok ok)" ||
+        { row journal "$(bad 'needs a hand')" "$(bad "run $(base "$JOURNAL_SYNC") by hand to see why")"; act; }
+    fi
+  fi
+
+  # Stage 3: the link manifest. THE bug this tool was built for: the repo
+  # puller pulls commits but never re-linked, so a new entry landed
+  # nowhere. Assert the artifact (manifest vs reality), never a git-history
+  # proxy for "did the repo gain files".
+  if [[ -n "$SETUP_SERVER" && -r "$SETUP_SERVER" ]]; then
+    if [[ -n "$diverged" ]]; then
+      row links "$(dim 'skipped — repos diverged')" "$(dim 'code before manifests')"
+    elif bash "$SETUP_SERVER" --check >/dev/null 2>&1; then
+      row links "link manifest" "$(ok clean)"
+    elif [[ $dry -eq 1 ]]; then
+      row links "$(bad 'gaps present')" "$(dim "would run $(base "$SETUP_SERVER")")"; pend
+    else
+      bash "$SETUP_SERVER" >/dev/null 2>&1
+      if bash "$SETUP_SERVER" --check >/dev/null 2>&1; then
+        row links "gaps closed" "$(ok 'LINKS_FIXED')"
+      else
+        row links "$(bad 'still failing --check after apply')" "$(bad VERIFY_FAILED)"; act
+      fi
+    fi
+  fi
+
+  # Stage 4: the dots repo's own links, gated by its dry run. Its exit 2 is a
+  # real conflict (a newer file in HOME) and is never resolved automatically.
+  local dr; dr="$(dots_repo || true)"
+  if [[ -n "$dr" && -r "$dr/install.sh" ]]; then
+    local prof; prof="$(bget "$THISBOX" profile "")"
+    if [[ -z "$prof" ]]; then
+      row dots "$(dim 'no profile= in the roster')" "$(dim 'skipped — install.sh requires one')"
+    else
+      local out; out="$(cd "$dr" && DRY_RUN=1 bash install.sh "--$prof" 2>&1)"; local irc=$?
+      if grep -qiE 'uncommitted changes' <<<"$out"; then
+        row dots "$(bad 'dirty repo blocks link management')" \
+          "$(bad "commit or stash in ${dr/#$HOME/\~}")"; act
+      elif [[ $irc -eq 2 ]] || grep -qi 'CONFLICT' <<<"$out"; then
+        # Name the files. "resolve by hand" without saying which files is a
+        # finding the reader has to re-derive, which is most of the work.
+        local nconf; nconf="$(grep -ci 'CONFLICT ' <<<"$out" || echo 0)"
+        row dots "$(bad "$nconf file(s) in HOME newer than the repo")" "$(bad 'resolve by hand')"
+        grep -i 'CONFLICT ' <<<"$out" | sed 's/.*CONFLICT //; s/ is newer.*//' |
+          sed "s|^$HOME|~|" | head -5 | sed 's/^/           /'
+        act
+      elif grep -qiE '\[FAIL\]' <<<"$out"; then
+        # A refusal is not "nothing to do". Reading it as success is the exact
+        # mistake this stage exists to avoid: the installer declined, so the
+        # link state here is UNKNOWN, not clean.
+        row dots "$(bad 'installer refused')" \
+          "$(bad "$(grep -iE '\[FAIL\]|uncommitted' <<<"$out" | head -1 | sed 's/.*\] //' | cut -c1-40)")"
+        act
+      elif grep -qE 'DRY-RUN +would (backup\+link|link|decrypt|chmod)|^\[install\] +(link|relink)' <<<"$out"; then
+        if [[ $dry -eq 1 ]]; then
+          row dots "$(dim 'pending link changes')" "$(dim 'would run install.sh')"; pend
+        else
+          (cd "$dr" && bash install.sh "--$prof" >/dev/null 2>&1) &&
+            row dots "links applied" "$(ok LINKS_FIXED)" ||
+            { row dots "$(bad 'install.sh failed')" "$(bad 'see its output')"; act; }
+        fi
+      else
+        row dots "${dr/#$HOME/\~}" "$(ok 'nothing pending')"
+      fi
+    fi
+  fi
+
+  # Stage 5: timers. Expected set is roster data; capability is probed.
+  local want; want="$(bget "$THISBOX" timers "")"
+  if [[ -n "$want" ]]; then
+    if systemctl --user show-environment >/dev/null 2>&1; then
+      local t missing=""
+      for t in $want; do
+        systemctl --user is-enabled "$t.timer" >/dev/null 2>&1 || missing+="$t "
+      done
+      if [[ -z "$missing" ]]; then
+        row timers "$(wc -w <<<"$want") expected" "$(ok 'all enabled')"
+      elif [[ $dry -eq 1 ]]; then
+        row timers "$(bad "missing: ${missing% }")" "$(dim "would run $(base "${TIMER_INSTALL:-the timer installer}")")"; pend
+      elif [[ -n "$TIMER_INSTALL" && -x "$TIMER_INSTALL" ]]; then
+        bash "$TIMER_INSTALL" >/dev/null 2>&1
+        missing=""
+        for t in $want; do
+          systemctl --user is-enabled "$t.timer" >/dev/null 2>&1 || missing+="$t "
+        done
+        [[ -z "$missing" ]] &&
+          row timers "reinstalled" "$(ok TIMERS_FIXED)" ||
+          { row timers "$(bad "still missing: ${missing% }")" "$(bad VERIFY_FAILED)"; act; }
+      else
+        row timers "$(bad "missing: ${missing% }")" "$(bad 'no installer on this box')"; act
+      fi
+    elif [[ -n "$CRON_INSTALL" && -x "$CRON_INSTALL" ]]; then
+      row timers "$(dim 'no user manager')" "$(dim "cron fallback — $(base "$CRON_INSTALL")")"
+    fi
+  fi
+
+  # Stage 6: report on artifacts, not on the stages' own exit codes. A stage
+  # that claims success while the re-check disagrees is the failure mode this
+  # exists to catch.
+  local es
+  for es in "$dr/install-editor-stack.sh"; do
+    [[ -n "$dr" && -x "$es" ]] || continue
+    bash "$es" --check >/dev/null 2>&1 &&
+      row editor "install-editor-stack --check" "$(ok clean)" ||
+      row editor "$(dim 'GAPS — interactive, so a note not a failure')" "$(dim EDITOR_GAPS)"
+  done
+
+  if [[ $dry -eq 1 ]]; then
+    row result "$PENDING stage(s) would act" \
+      "$( [[ $RC -eq 0 ]] && dim 'nothing needs a human' || bad 'a human must act first' )"
+  else
+    row result "$( [[ $RC -eq 0 ]] && echo 'nothing needs you' || echo 'see the lines above' )" \
+      "$( [[ $RC -eq 0 ]] && ok ok || bad 'a human must act' )"
+  fi
+  rc_final
+}
+
+# --- push -------------------------------------------------------------------
+# The reverse of sync. sync brings this box level with its origins; push
+# publishes what this box did: every declared repo that is dirty is committed,
+# every repo that is then ahead is pushed. It is the one verb that writes past
+# this box, and it writes only this box's own upstreams, only as a
+# fast-forward. Three of the last five commits on the tool repo were typed by
+# hand as "latest from fleet"; this is that habit with a message that says
+# which box and when, and a body that says what.
+#
+# Order per repo, and why: fetch, fast-forward if behind, THEN commit, then
+# push. Committing first would turn a merely stale box into a diverged one,
+# and stale is what most boxes are most mornings.
+#
+# On divergence the rule is sync's rule: surfaced, never merged here. The
+# dirty tree is still committed, because a local commit is the durable way to
+# hold work and `git pull --rebase` by hand is then the whole fix, but nothing
+# is pushed from that repo.
+#
+# The journal is delegated to rig.journal (rig.journal_repo), which commits with this same
+# grammar and carries the union-merge and dedup logic nothing here should
+# duplicate. Its message is its own; -m does not reach it.
+push_default_msg() { printf 'sync: %s %s' "$THISBOX" "$(date '+%Y-%m-%d %H:%M')"; }
+
+art_push() { # nrepos dry
+  art_on || return 0
+  local tail="commit · fast-forward · push"; [[ "${2:-0}" == 1 ]] && tail="dry run, nothing written"
+  printf '\n'
+  printf '%s\n' "    ${C_MINE}◆${C_DIM}━━━━${C_OK}▶${C_0} ${C_PATH}◇${C_0} ${C_DIM}origin${C_0}   ${C_DIM}${1} repo(s) · ${tail}${C_0}"
+  printf '\n'
+}
+
+# push_commit DIR MSG — stage everything and commit. The body is the
+# name-status list, so a sync commit can be read later without a diff.
+# Returns 1 with the row already printed when the commit did not happen.
+push_commit() {
+  local d="$1" msg="$2" lbl body n
+  lbl="  $(shortlabel "$d")"
+  git -C "$d" add -A 2>/dev/null ||
+    { brow "$lbl" "$(bad 'git add failed')" "$(bad 'see the repo')"; act; return 1; }
+  body="$(git -C "$d" diff --cached --name-status)"
+  n="$(grep -c . <<<"$body")"
+  (( n > 60 )) && body="$(head -60 <<<"$body")"$'\n'"… and $((n - 60)) more"
+  git -C "$d" commit -q -m "$msg" -m "$body" >/dev/null 2>&1 ||
+    { brow "$lbl" "$(bad 'commit refused')" "$(bad 'a hook said no, or nothing staged — see the repo')"; act; return 1; }
+}
+
+# push_one DIR DRY MSG — one repo, one row.
+push_one() {
+  local d="$1" dry="$2" msg="$3" lbl
+  lbl="  $(shortlabel "$d")"
+  if [[ ! -d "$d/.git" && ! -f "$d/.git" ]]; then
+    brow "$lbl" "$(dim 'not checked out here')" "$(dim absent)"; return
+  fi
+  if (cd "$d" && { [[ -e "$(git rev-parse --git-path MERGE_HEAD)" ]] ||
+                   [[ -d "$(git rev-parse --git-path rebase-merge)" ]] ||
+                   [[ -d "$(git rev-parse --git-path rebase-apply)" ]]; }); then
+    brow "$lbl" "$(bad 'unfinished merge or rebase')" "$(bad 'finish it by hand — untouched')"; act; return
+  fi
+  local br up
+  br="$(git -C "$d" symbolic-ref --short -q HEAD)" ||
+    { brow "$lbl" "$(dim 'detached HEAD')" "$(dim skipped)"; return; }
+  up="$(git -C "$d" rev-parse -q --abbrev-ref '@{u}' 2>/dev/null)" ||
+    { brow "$lbl" "$br" "$(dim 'no upstream — skipped')"; return; }
+
+  if [[ -n "$JOURNAL_REPO" && "$(readlink -f "$d")" == "$(readlink -f "$JOURNAL_REPO" 2>/dev/null)" ]]; then
+    local js; js="$(base "${JOURNAL_SYNC:-rig.journal}")"
+    if [[ -z "$JOURNAL_SYNC" || ! -x "$JOURNAL_SYNC" ]]; then
+      brow "$lbl" "$(dim "$js absent")" "$(dim skipped)"
+    elif [[ $dry -eq 1 ]]; then
+      brow "$lbl" "$(dim "would run $js")" "$(dim 'dry run')"; pend
+    elif bash "$JOURNAL_SYNC" >/dev/null 2>&1; then
+      brow "$lbl" "$js" "$(ok 'commit · pull · push')"
+    else
+      brow "$lbl" "$(bad "$js needs a hand")" "$(bad 'run it by hand to see why')"; act
+    fi
+    return
+  fi
+
+  local ndirty note=""
+  ndirty="$(git -C "$d" status --porcelain | grep -c .)"
+  timeout "$TIMEOUT" git -C "$d" fetch -q 2>/dev/null || note+="fetch failed · "
+
+  local head upsha state=level
+  head="$(git -C "$d" rev-parse HEAD)"; upsha="$(git -C "$d" rev-parse '@{u}')"
+  if [[ "$head" != "$upsha" ]]; then
+    if   git -C "$d" merge-base --is-ancestor "$upsha" "$head" 2>/dev/null; then state=ahead
+    elif git -C "$d" merge-base --is-ancestor "$head" "$upsha" 2>/dev/null; then state=behind
+    else state=diverged; fi
+  fi
+
+  if [[ $state == behind ]]; then
+    local nb; nb="$(git -C "$d" rev-list --count "$head..$upsha")"
+    if [[ $dry -eq 1 ]]; then
+      note+="would fast-forward $nb · "; pend; state=level
+    elif git -C "$d" merge --ff-only -q '@{u}' 2>/dev/null; then
+      note+="fast-forwarded $nb · "; state=level
+    else
+      # git refused because origin's commits touch files this box edited.
+      note+="origin moved under your edits · "; state=diverged
+    fi
+  fi
+
+  if (( ndirty > 0 )); then
+    if [[ $dry -eq 1 ]]; then
+      note+="would commit $ndirty change(s) · "; pend
+    else
+      push_commit "$d" "$msg" || return
+      note+="committed $ndirty change(s) · "
+    fi
+    [[ $state == level ]] && state=ahead
+  fi
+
+  case "$state" in
+    diverged)
+      brow "$lbl" "$(bad "$br diverged from $up")" "$(bad "${note}resolve by hand, nothing pushed")"; act ;;
+    level)
+      brow "$lbl" "$br → $up" "$(ok "${note}level")" ;;
+    ahead)
+      local na; na="$(git -C "$d" rev-list --count '@{u}..HEAD')"
+      if [[ $dry -eq 1 ]]; then
+        (( ndirty > 0 )) && na=$((na + 1))
+        brow "$lbl" "$br → $up" "$(dim "${note}would push $na")"; pend
+      elif timeout $(( TIMEOUT * 5 )) git -C "$d" push -q 2>/dev/null; then
+        brow "$lbl" "$br → $up" "$(ok "${note}pushed $na")"
+      else
+        brow "$lbl" "$(bad "$br → $up")" "$(bad "${note}push failed — commit kept, retry")"; act
+      fi ;;
+  esac
+}
+
+cmd_push() {
+  local dry=0 msg=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry=1 ;;
+      -m)        [[ $# -ge 2 ]] || die "push: -m needs a message"; msg="$2"; shift ;;
+      *)         die "push: unknown option $1 (-m MSG, --dry-run)" ;;
+    esac
+    shift
+  done
+  [[ -n "$msg" ]] || msg="$(push_default_msg)"
+
+  # The same preflight as sync: a write has to know whose box this is.
+  have_roster || die "no roster at ${BOXES/#$HOME/\~} — rig boxes --stanza prints a starting stanza"
+  in_roster "$THISBOX" ||
+    die "$THISBOX is not in the roster; add this and re-run:
+$(cmd_boxes --stanza | sed 's/^/           /')"
+  [[ "$(bget "$THISBOX" own yes)" == no ]] &&
+    die "$THISBOX is marked own=no — rig never writes from a box that is not yours"
+
+  mkdir -p "$RUN"
+  exec 8>"$RUN/push.lock"
+  if ! flock -n 8; then
+    row lock "another rig push holds it" "$(dim 'LOCKED — transient, exiting 0')"
+    return 0
+  fi
+
+  # Declared repos, tilde expanded textually, one entry per real path.
+  # push= narrows the set: a repo listed in repos= but not in push= is synced
+  # but never auto-committed (a public repo must not get "sync: <host>" commits).
+  local -a repos=(); local r real seen=" " plist
+  plist="$(bget "$THISBOX" push "")"; [[ -n "$plist" ]] || plist="$(repos_for "$THISBOX")"
+  for r in $plist; do
+    r="${r/#\~/$HOME}"
+    real="$(readlink -f "$r" 2>/dev/null || printf '%s' "$r")"
+    case "$seen" in *" $real "*) continue ;; esac
+    seen+="$real "; repos+=("$r")
+  done
+
+  sc_band push "$THISBOX$([[ $dry -eq 1 ]] && echo ' · dry run')"
+  art_push "${#repos[@]}" "$dry"
+  brow "  message" "$(dim "$msg")"
+  for r in "${repos[@]}"; do push_one "$r" "$dry" "$msg"; done
+
+  if [[ $dry -eq 1 ]]; then
+    brow "  result" "$PENDING change(s) would be made" \
+      "$( [[ $RC -eq 0 ]] && dim 'nothing needs a human' || bad 'a human must act first' )"
+  else
+    brow "  result" "$( [[ $RC -eq 0 ]] && echo 'published' || echo 'see the lines above' )" \
+      "$( [[ $RC -eq 0 ]] && ok ok || bad 'a human must act' )"
+  fi
+  rc_final
+}
+
+usage() {
+  sed -n '2,11p' "$SELF" | sed 's/^# \{0,1\}//'
+  printf '\n%sman rig%s for the full page · art on a tty (RIG_ART=1 forces, RIG_NO_ART=1 hides)\n' \
+    "$C_DIM" "$C_0"
+}
+
+cmd_help() {
+  if [[ -t 1 ]] && [[ -f "$MANSRC" ]] && command -v man >/dev/null 2>&1; then
+    man -l "$MANSRC"
+  else
+    sc_splash; usage
+  fi
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    ""|here)   cmd_here ;;
+    status)    cmd_status "${1:-}" ;;
+    sync)      cmd_sync "$@" ;;
+    push)      cmd_push "$@" ;;
+    doctor)    cmd_doctor "$@" ;;
+    boxes)     cmd_boxes "$@" ;;
+    __id)      sc_id ;;
+    -h|--help) cmd_help ;;
+    *)         die "unknown subcommand $cmd (rig --help)" ;;
+  esac
+}
+
+main "$@"
+
+# sc-fleet — membership marker read by `sc`; identity is set near the top.

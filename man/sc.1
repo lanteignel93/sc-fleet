@@ -1,0 +1,209 @@
+.TH SC 1 "2026-10-02" "sc-fleet 0.1.0" "sc-fleet manual"
+.SH NAME
+sc \- the spacecowboy fleet: one namespace over a set of small tools
+.SH SYNOPSIS
+.nf
+\fBsc\fR
+\fBsc ls\fR
+\fBsc logo\fR
+\fBsc\fR \fItool\fR [\fIargs\fR...]
+.fi
+.SH DESCRIPTION
+\fBsc\fR is a dispatcher and an identity, not a framework. It gives a set of
+independent shell tools one namespace, one palette, one output grammar, and
+one man page each.
+.PP
+Running a tool through \fBsc\fR is identical to calling it directly:
+\fBsc wt ls\fR and \fBwt ls\fR are the same binary with the same arguments.
+The namespace exists so the fleet is discoverable, not so it is mandatory.
+.SH MEMBERSHIP
+Membership is not a manifest, which would only drift. A tool is a member
+when it
+.RS
+.IP \(bu 2
+lives in the same directory as \fBsc\fR (not in \fIlib/\fR),
+.IP \(bu 2
+is executable,
+.IP \(bu 2
+carries a line beginning \fB# sc-fleet\fR, and
+.IP \(bu 2
+answers the hidden \fB__id\fR verb.
+.RE
+.PP
+The marker is checked by reading the file, \fIbefore\fR anything is executed,
+so \fBsc\fR never runs a neighbouring script merely to ask what it is.
+.PP
+Because membership is derived rather than listed, dropping a conforming tool
+into the directory is the whole of installation:
+\fBinstall.sh\fR reads the same marker to decide what to link
+onto \fBPATH\fR and into the man path.
+.PP
+Members are looked for in the directory \fBsc\fR lives in and then in
+\fBSC_BIN_EXTRA\fR (default \fI~/.local/bin\fR), one entry per real path,
+so a symlink to a tool already seen is not a second tool. That is how a tool
+kept in another repository joins: \fBdye\fR lives in the dots, carries the
+marker, and reaches the roster, the menu, the completion and \fBsc dye\fR
+through its \fI~/.local/bin\fR link. Tools the fleet expects on every box
+are still only those in \fBsc\fR's own directory; \fBrig\fR reads that.
+.SH THE CONTRACT A TOOL SIGNS
+A member sets four facts and sources the shared kit:
+.PP
+.RS
+.nf
+SC_TOOL='wt'                          # <= 7 chars: sc ls pads to %-7s
+SC_TAGLINE='one worktree per topic'
+SC_MOTTO='every checkout a sibling'
+SC_SIGIL=$' \(rs\(rsu256d\(rs\(rsu25c6 \(rsn...'   # 3 rows, each padded to 4 CHARACTERS
+\&. "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/lib/sckit.sh"
+.fi
+.RE
+.PP
+Sigil rows are padded to four \fIcharacters\fR by hand because bash pads
+field widths by bytes, and every glyph in the fleet is multibyte.
+.PP
+\fB__id\fR prints six tab-separated fields on one line: name, tagline, motto,
+and the three sigil rows. Tab separated so the rows keep their padding.
+.PP
+\fBThe kit must be optional.\fR Each tool sources \fIlib/sckit.sh\fR inside a
+conditional and provides its own fallbacks, so a single file copied to a bare
+box still runs. The test suites enforce this by copying a tool alone into a
+directory with no \fIlib/\fR and asserting \fB--help\fR still exits 0.
+.SH OUTPUT GRAMMAR
+The kit supplies the shared vocabulary: \fBrow\fR (a 9-wide dim label, a
+42-wide value, a free-form note), \fBok\fR, \fBbad\fR and \fBdim\fR for the
+note column, \fBwarn\fR, and \fBdie\fR, which prints \fBrefuse\fR to stderr
+and exits 1. Width budget is 72 columns.
+.PP
+Refusals name the offending fact and then the command that fixes it.
+.SS Art
+A fixed alphabet, so a diagram means the same thing in every tool:
+.PP
+.RS
+.nf
+\(em heavy    durable: a clone, a store, a trunk
+\(em light    ephemeral: a topic, a worktree, a shell
+\(em dashed   gone: pruned, deleted
+\(bu landed   \(di yours   \(ci elsewhere
+.fi
+.RE
+.PP
+Glyphs are drawn only for a human: never into a pipe, never in
+\fB--porcelain\fR output, and off entirely with \fI<TOOL>\fB_NO_ART\fR. At the
+same precedence "off" beats "on", so \fBSC_NO_ART=1\fR in CI cannot be undone
+by a stray \fBSC_ART\fR elsewhere.
+.SH COMMANDS
+.SS sc
+At a terminal with \fBfzf\fR, the menu under the logo: the tools first, each
+previewing its verbs, then the chosen tool's verbs to pick from. Through a
+pipe, or without fzf, the logo, the roster and the usage. See THE MENU.
+.SS sc \fItool\fR
+A member named alone opens the menu filtered to that tool's verbs, rather
+than running the tool bare. Most tools do something on a bare invocation;
+from \fBsc\fR, the menu is the safer default.
+.SS sc ls
+The roster alone: one line per member, its middle sigil row and its tagline.
+.SS sc logo
+The full banner, drawn even into a pipe, for pasting into a README: a night in
+the desert (a ringed planet, the moon, a saguaro, the cowboy and his terminal)
+above the name, coloured in the worn theme's roles at a terminal and plain
+ASCII through a pipe.
+.SS sc \fItool\fR [\fIargs\fR...]
+Run a fleet tool. Refuses a name that is not a member, and names \fBsc ls\fR.
+.PP
+A shell function of the same name takes precedence when one exists, because
+some subcommands can only act inside the calling shell: \fBsc wt cd\fR and
+\fBsc arm\fR would otherwise run in a child process and change nothing. See
+\fBfleet.zsh\fR.
+.SH THE MENU
+Derived, like the roster: no list to drift. Every member declares its verbs
+in its header block in one grammar,
+.PP
+.RS
+.nf
+#   rig doctor [--disk]    what is missing or misconfigured here
+.fi
+.RE
+.PP
+and its own \fBusage()\fR prints those lines. The menu parses the same
+lines: the verb plus anything that looks like arguments is the command, what
+follows is the description, a trailing \fB# text\fR counts as the
+description too (\fBwt\fR's convention), and a deeper-indented next line
+continues the entry. A verb is in the menu the moment its header line exists.
+.PP
+Two levels, both under the logo. The first lists the tools with their
+taglines and previews the highlighted tool's verbs on the right; Enter opens
+that tool's verbs. Escape there goes back to the tools. The full scene needs
+forty rows above a list, so on a shorter terminal the wordmark stands in and
+the logo is still there.
+.PP
+Enter runs a flag-only verb as picked (\fBrig doctor\fR, \fBwt ls\fR). A
+verb that needs a value, a required \fI<slug>\fR or a bracketed VALUE word
+such as \fB[-m MSG]\fR, lands on the prompt instead with the cursor at the
+end, to be finished and sent. Tab forces the prompt for any entry, which is
+how you add an optional flag or look before you leap. Escape cancels.
+.PP
+The menu wears the theme through \fBFZF_DEFAULT_OPTS\fR, which \fBdye\fR
+renders.
+.PP
+The split of labour: the binary derives the entries (\fBsc __menu\fR, TSV of
+tool, command, description, needs-args) and runs fzf (\fBsc __pick\fR); the
+shell function in \fBfleet.zsh\fR is what can run a shell function such as
+\fBwt cd\fR or bare \fBarm\fR, or place text on your prompt, so the
+decision to run or prefill lives there. A pick's exit is 0, a cancel 1, and
+"no menu here" 2, on which the function shows the splash instead.
+.SH THE FLEET
+.TP
+.B wt
+One worktree per topic, across projects and forges.
+.TP
+.B arm
+Re-arm running shells with the current kit.
+.TP
+.B crew
+Every Claude session you have running, and what it is doing.
+.SH FILES
+.TP
+.I bin/sc
+The dispatcher, in the sc-fleet checkout. It carries no \fB# sc-fleet\fR marker of its own and excludes
+itself from the roster by name.
+.TP
+.I lib/sckit.sh
+The shared kit: palette, art helpers, output vocabulary, \fBsc_id\fR.
+.TP
+.I lib/mkart.py
+Regenerates the logo block in the kit from its drawing: ASCII sprites, each
+character tagged with a palette role. Run by hand at authoring
+time; nothing calls it at run time.
+.TP
+.I shell/fleet.zsh
+The fleet's shell surface: functions and completion wiring, sourced once at
+startup and again by \fBarm\fR.
+.TP
+.I tests/fixtures/voidrunner.json
+The palette the kit's built-in colours must agree with. \fBtests/test_sc.sh\fR fails if they
+drift apart.
+.TP
+.I tests/test_sc.sh
+The test suite. Run: \fBbash tests/test_sc.sh\fR
+.SH ENVIRONMENT
+.TP
+.B SC_BIN_EXTRA
+Space-separated directories searched for members after \fBsc\fR's own.
+Default \fI~/.local/bin\fR; set empty to search only the fleet's directory.
+.TP
+.B SC_W
+Width budget. Default 72.
+.TP
+.B SC_ART
+Force art even into a pipe, which is what makes banners testable.
+.TP
+.B SC_NO_ART \fRor\fB NO_COLOR
+Suppress art, or colour. Per-tool \fI<TOOL>\fB_ART\fR and
+\fI<TOOL>\fB_NO_ART\fR override these; the most specific setting wins.
+.SH EXIT STATUS
+0 on success; 1 on a refusal, with a \fBrefuse\fR line on stderr. A dispatched
+tool's status passes through unchanged, because \fBsc\fR \fBexec\fRs it.
+.SH SEE ALSO
+.BR wt (1),
+.BR arm (1),
+.BR crew (1)

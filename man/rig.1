@@ -1,0 +1,433 @@
+.TH RIG 1 "2026-10-02" "sc-fleet 0.1.0" "sc-fleet manual"
+.SH NAME
+rig \- what this box is, and whether it is current
+.SH SYNOPSIS
+.nf
+\fBrig\fR
+\fBrig status\fR [\fB-a\fR]
+\fBrig sync\fR [\fB--dry-run\fR] [\fB--fleet\fR]
+\fBrig push\fR [\fB-m\fR \fImsg\fR] [\fB--dry-run\fR]
+\fBrig doctor\fR [\fB--disk\fR [\fIpath\fR]]
+\fBrig boxes\fR [\fB--lint\fR | \fB--stanza\fR]
+.fi
+.SH DESCRIPTION
+Nothing knew what was true on which box. On one morning a report invented
+four dead pipelines out of job logs under a mount that box does not have; a
+link checker called nine unmounted citations rotted; a fix that was pushed
+read as unpushed because the work was on the other machine; and two capacity
+walls were hit in a day. All four are the same missing question.
+.PP
+\fBrig\fR answers it, and can bring the box you are sitting on back into
+line.
+.SH THE TWO RULES
+.SS Git remotes are the authority
+Every box is a replica reconciling to its own upstream. "In sync" means clean
+and level. Divergence is surfaced and \fInever\fR merged automatically,
+because a machine cannot know which side you meant.
+.SS Read all, write local by default
+Every box in the roster can be read over ssh. Only the box you are sitting on
+is changed, unless you ask for otherwise in as many words with
+\fBsync --fleet\fR, which is a flag, never a default, and runs sequentially.
+\fBpush\fR is the one verb that writes past this box, and it writes only to
+this box's own upstreams, only as a fast-forward.
+.PP
+The asymmetry between \fBstatus\fR and \fBsync\fR follows from this: reading
+with no roster degrades to this box and says so, while writing with no roster
+refuses, because a write has to know whose box this is.
+.SH WHAT RIG DOES NOT DO
+The idempotent installers a site already has are delegated to verbatim, each
+named by a config key (see CONFIGURATION): a fast-forward puller for the
+config repos (\fBrig.pull\fR, with its own \fBDIVERGED\fR classification), a
+journal sync (\fBrig.journal\fR), a link installer with a \fB--check\fR mode
+(\fBrig.installer\fR), and a timer installer (\fBrig.timer_installer\fR, or
+\fBrig.cron_installer\fR where there is no systemd user manager). \fBrig
+sync\fR sequences them. A key that is unset is a skipped stage, never a
+finding.
+.PP
+It adds exactly two things none of them had: noticing that the link manifest
+has \fIgained an entry\fR, and reconciling the expected timer set against the
+actual one.
+.PP
+It also does not duplicate a fleet-health monitor. A monitor answers "is the
+fleet healthy" across every host; \fBrig\fR answers "is my tooling current on
+the boxes I work on", which is a much smaller set.
+.SH COMMANDS
+.SS rig
+This box: per-repo state against its upstream, declared mounts, timers with
+their last run, free space and available memory.
+.PP
+With no roster this still works. Repos are discovered by walking one level
+under \fB$HOME\fR and \fB$XDG_CONFIG_HOME\fR for a checkout with a configured
+upstream, deduplicated by real path so a repo reached through a symlinked
+alias counts once. Absence of data never manufactures a finding: with no
+declared timer set, no timer is reported missing.
+.SS rig status -a
+Every box in the roster, probed read-only in parallel and rendered in roster
+order so the output is stable run to run. A box that times out, refuses or
+returns a truncated stream is marked transient and does not abort the sweep.
+A box marked \fBown=no\fR is skipped unless \fBRIG_INCLUDE_UNOWNED\fR is set;
+a box with no \fBssh=\fR alias is listed as registry-only and never contacted.
+.SS rig sync [--dry-run]
+Bring this box current. \fB--dry-run\fR reports what each stage would do and
+changes nothing.
+.PP
+Order, and why: repos first, because stages 3 to 5 must apply the link list
+and unit files that the pull just brought in. A repo that diverged skips
+\fIits own\fR dependent stages only, not the whole run, since refusing
+everything over one divergence is how a box goes stale for a week.
+.PP
+.RS
+.nf
+1  repos       rig.pull
+2  journal     rig.journal
+3  links       rig.installer --check, then apply
+4  dots        the dots installer's dry run, then apply
+5  timers      rig.timer_installer, or rig.cron_installer
+6  verify      re-run the cheap checks and report on artifacts
+.fi
+.RE
+.PP
+Stage 6 reports on \fIartifacts\fR, not on the stages' own exit codes,
+because a stage that claims success while the re-check disagrees is precisely
+the failure this is meant to catch.
+.PP
+The dots installer is located by resolving \fI~/.zshrc\fR to its repository
+rather than by name, so no directory name is baked into the tool.
+.SS rig sync --fleet
+Run \fBrig sync\fR on every owned box in the roster, including this one.
+.PP
+This is the one place \fBrig\fR writes to a box it is not sitting on, so it
+is a flag and never a default. It runs \fIsequentially\fR, because these are
+writes and a parallel mistake reaches every box at once. A box marked
+\fBown=no\fR is refused exactly as it would be locally, a box with no
+\fBssh=\fR alias is skipped, and a failure on one box never stops the rest.
+.PP
+Nothing is reimplemented remotely: each box runs its own local \fBrig
+sync\fR, so the stages, refusals and exit contract are identical everywhere.
+.PP
+A box that does not have \fBrig\fR yet is bootstrapped first: a
+fast-forward pull of its own checkout, then that checkout's installer, then
+the sync. The pull comes first because a box being bootstrapped is by
+definition behind, and its older installer would link only the tools it knew
+about.
+.PP
+\fB--dry-run\fR composes with it and reports what each box would do.
+.SS rig push [-m msg] [--dry-run]
+The reverse of \fBsync\fR. \fBsync\fR brings this box level with its
+origins; \fBpush\fR publishes what this box did. Every repo the roster
+declares for this box is visited: a dirty tree is committed, whole
+(\fBgit add -A\fR, so untracked files are included and ignored ones are
+not), and a repo that is then ahead is pushed. \fB--dry-run\fR fetches, so
+the ahead and behind counts are real, and writes nothing.
+.PP
+The default message is
+.RS
+.nf
+sync: <box> <YYYY-MM-DD HH:MM>
+.fi
+.RE
+which is the grammar a journal sync can share, so one
+\fBgit log --grep '^sync:'\fR finds every fleet sync commit in every repo.
+One message is computed per run and shared by every repo it commits, so the
+commits correlate. \fB-m\fR \fImsg\fR replaces it. The body of each sync
+commit is the name-status list of what it staged, so it can be read later
+without a diff.
+.PP
+Order per repo, and why: fetch, fast-forward if behind, \fIthen\fR commit,
+then push. Committing first would turn a merely stale box into a diverged
+one, and stale is what most boxes are most mornings.
+.PP
+Divergence follows the first rule: surfaced, never merged here. The dirty
+tree is still committed, because a local commit is the durable way to hold
+work and \fBgit pull --rebase\fR by hand is then the whole fix, but nothing
+is pushed from that repo and the run exits 1. The same applies when a
+fast-forward is refused because origin's commits touch files this box edited.
+.PP
+The journal repo (\fBrig.journal_repo\fR) is delegated to the
+\fBrig.journal\fR script, which owns whatever merge and dedup logic a journal
+needs and nothing here should duplicate. Its message is its own; \fB-m\fR
+does not reach it.
+.PP
+A roster \fBpush=\fR list narrows what \fBpush\fR may commit, while
+\fBrepos=\fR is still what \fBsync\fR and \fBstatus\fR read. Leave a public
+repo out of it, so an automatic \fBsync: <box>\fR commit can never put a
+host name into its history.
+.PP
+A repo that is absent on this box, detached, or without an upstream is
+reported and skipped. An unfinished merge or rebase is never touched. The
+push itself gets five times \fBRIG_TIMEOUT\fR.
+.SS rig doctor [--disk [path]]
+Read-only, and the one door for dotfile drift. Whether the probe, roster and
+the configured installers are present, whether this box is registered, whether the
+dots repo's own checks pass, whether the link manifest is clean, and whether
+the expected timers are enabled. Diagnoses and names the fix; never repairs.
+.PP
+Four incidents in one summer were all the same class: a rc file that had
+become a plain file, a package the dots alias through that was not there, a
+secret that had to be hand-built per host, a theme copied across by hand.
+Each gained a checker behind a different door. \fBdoctor\fR runs them all
+and answers with one exit code.
+.PP
+The last three rows are integrations with a dotfiles repo, and each is a
+skip when its tool or file is absent:
+.PP
+.RS
+.nf
+editor   the dots repo's install-editor-stack.sh --check: shell plugins,
+         tree-sitter, nvim vintage, and the cli tools the dots assume
+         (bat, fzf, rg). Gaps are listed and exit 1 — the script is
+         interactive, so nothing unattended can close them, which is why
+         sync reports the same result as a note and doctor as a finding.
+theme    dye doctor: the theme bundle's own drift check. Its summary
+         line is the contract; the FAIL rows are listed. A box without
+         dye is a skip, a dye that dies before its summary is a finding.
+secrets  the age-sealed ~/.zsh_secrets the dots carry: age present, this
+         box's identity present and mode 600, its public key listed in
+         secrets/recipients.txt, the blob present, the decrypted copy
+         present, mode 600 and byte-identical. The first failing state
+         is the row, and it names the one command that fixes it. A dots
+         repo with nothing sealed is a skip. The identity is
+         ~/.config/age/dotfiles.key, never the vault-backup key.
+.fi
+.RE
+.PP
+\fB--disk\fR [\fIpath\fR] adds a disk triage per filesystem: one niced,
+ioniced \fBdu\fR under a time budget (\fBRIG_DISK_BUDGET\fR, 300 s per
+root), the largest directories at depths one and two, the junk patterns
+worth reviewing (caches, __pycache__, node_modules, virtualenvs, old
+backups), and a report. Roots are the roster's \fBmounts=\fR plus home and
+/tmp, or the one \fIpath\fR you name. The raw traversal and the markdown
+report land under \fI~/.local/state/rig/disk/\fR, never over ssh: doctor is
+local. A root under 2 GB free is a finding; a traversal cut short by the
+budget says PARTIAL and is not passed off as complete. Nothing is deleted.
+.PP
+Extra timers, enabled here but absent from the roster, are reported and
+\fInever\fR disabled. Some are the system's own, and silently disabling
+things is the class of surprise this tool exists to remove.
+.SS rig boxes [--lint | --stanza]
+The roster: one line per box with its role, alias and ownership.
+.PP
+\fB--lint\fR checks the roster for IP addresses and dotted names outside
+\fBmounts=\fR, because the file may sit in a repository that is shared.
+.PP
+\fB--stanza\fR [\fIname\fR] prints a paste-ready stanza, for this box or a
+named one. It is also what a refusal shows you when the box is unregistered.
+.PP
+\fB--add\fR \fIname\fR appends that stanza to the roster and lints the
+result, which is the whole of adding a new server.
+.SH IS THE FLEET INSTALLED THERE
+The roster declares which boxes should have the tools; \fBown=yes\fR is the
+statement of intent. The probe reports what each box actually has, by listing
+its \fI~/.local/bin\fR. The expected set is derived from the
+\fB# sc-fleet\fR markers here, the same rule the installer uses, so a new
+tool becomes expected everywhere the moment it exists.
+.PP
+\fBrig status -a\fR therefore prints a \fBfleet\fR line per box: either the
+count installed, or which tools are missing and that the box has not been set
+up. That gap is what \fBsync --fleet\fR closes.
+.SH THE ROSTER
+Default \fI~/.config/rig/boxes.conf\fR, plus an optional
+\fIboxes.local.conf\fR whose values win per box and key, so a machine can
+carry an untracked tweak without editing shared data.
+.PP
+Stanzas opened by a \fBbox=\fR line, \fBkey=value\fR after it, grep-parsed and
+never sourced. \fBbox=@defaults\fR supplies every key a box does not set.
+.PP
+.RS
+.nf
+box=@defaults
+repos=~/config ~/notes ~/dotfiles ~/src/sc-fleet/main
+push=~/config ~/notes ~/dotfiles
+timers=notes-sync config-pull
+sched=auto
+own=yes
+profile=work
+bootstrap_repo=~/src/sc-fleet/main
+bootstrap=install.sh
+
+box=atlas
+ssh=atlas
+role=dev
+mounts=/data
+note=one line for a human
+.fi
+.RE
+.PP
+Keys: \fBssh\fR (absent means registry-only), \fBrole\fR, \fBown\fR,
+\fBprofile\fR (the argument the dots installer requires; guessing it wrong
+stamps commits with the wrong git identity, so it is data), \fBsched\fR,
+\fBtimers\fR, \fBrepos\fR, \fBpush\fR (what \fBrig push\fR may commit;
+default \fBrepos\fR), \fBmounts\fR, \fBnote\fR, and for bootstrapping
+\fBbootstrap_repo\fR (where that box's checkout lives; defaults to this
+checkout's path under \fB$HOME\fR, expanded on that box, not here) and
+\fBbootstrap\fR (the installer inside it; default \fIinstall.sh\fR).
+.PP
+Deliberately absent: distro, editor version, whether a systemd user manager
+exists. All are cheaply probed, and a table of them would be a table of lies
+within a month.
+.PP
+\fBThe roster is site data and is never part of the tool.\fR It names hosts,
+so it belongs wherever your private configuration lives, symlinked to the
+path above by that repository's installer.
+.SH THE PROBE
+\fIlib/rig-probe.sh\fR is piped to the far side on stdin and run by
+\fB/bin/bash -s\fR, so nothing has to be installed there and a box in the
+middle of a broken dotfile still answers. It is read-only in three layers,
+layered because any one alone is a promise rather than a property: every git
+call passes a read-verb whitelist with \fB--no-optional-locks\fR; it never
+fetches, because fetching writes refs; and the test suite greps it against a
+command whitelist.
+.PP
+It therefore reports SHAs and nothing derived. All ancestry arithmetic happens
+on the caller, which fetches once locally, giving four verdicts: \fBlevel\fR,
+\fBahead\fR, \fBbehind\fR, and \fBunpushed\fR when the SHA is unknown here,
+meaning that box holds commits no other box has seen. \fBunpushed\fR is
+actionable information, not an error.
+.PP
+The stream ends with \fBend=ok\fR. That sentinel is load-bearing: a stream
+truncated because ssh died mid-write is caught by the missing sentinel, not
+by an exit code.
+.SH CONFIGURATION
+The delegated installers are site facts, so they live in the fleet config,
+\fI~/.config/sc-fleet/config\fR (a per-machine \fIconfig.local\fR beside it
+wins), and never in the tool. \fBsc config\fR shows the effective values.
+.TP
+.B rig.pull
+Fast-forward puller for the config repos. Its output, and the log named by
+\fBrig.pull_log\fR, are read for \fBDIVERGED\fR lines.
+.TP
+.B rig.journal\fR, \fBrig.journal_repo
+The journal sync script and the repo it owns; \fBpush\fR hands that repo to
+the script instead of committing it.
+.TP
+.B rig.installer
+Link installer. Must accept \fB--check\fR and print
+\fBMISSING\fR/\fBWRONG\fR/\fBNOTLINK\fR/\fBORPHAN\fR lines for gaps.
+.TP
+.B rig.timer_installer\fR, \fBrig.cron_installer
+Install the expected timers, under systemd or cron.
+.SH ENVIRONMENT
+.TP
+.B RIG_BOXES
+Roster path. Also read by \fBcrew\fR(1), which shares this roster.
+.TP
+.B RIG_BOX
+Override the box identity. Default \fBhostname -s\fR.
+.TP
+.B RIG_JOURNAL
+The journal repo; overrides \fBrig.journal_repo\fR.
+.TP
+.B RIG_DOTS
+The dots repo doctor delegates to. Default: the repository \fI~/.zshrc\fR
+resolves into.
+.TP
+.B RIG_DYE
+The \fBdye\fR binary for the theme row. Default: \fBdye\fR on PATH, then
+\fI~/.local/bin/dye\fR; absent means the row is skipped.
+.TP
+.B RIG_AGE
+The \fBage\fR binary for the secrets row; \fBage-keygen\fR is looked for
+beside it. Default: \fBage\fR on PATH, then \fI~/.local/bin/age\fR.
+.TP
+.B RIG_SECRETS_ID
+This box's identity. Default \fI$XDG_CONFIG_HOME/age/dotfiles.key\fR.
+.TP
+.B RIG_SECRETS_OUT
+The decrypted copy. Default \fI~/.zsh_secrets\fR.
+.TP
+.B RIG_SECRETS_BLOB\fR, \fBRIG_SECRETS_RECIPIENTS
+The sealed blob and the recipients list. Default under
+\fI<dots repo>/secrets/\fR.
+.TP
+.B RIG_DISK_PATHS
+Space-separated roots for \fB--disk\fR, replacing the roster set and any
+positional path. For tests and one-offs.
+.TP
+.B RIG_DISK_BUDGET
+Seconds \fB--disk\fR gives each root's traversal. Default 300.
+.TP
+.B RIG_STATE
+Default \fI~/.local/state/rig\fR.
+.TP
+.B RIG_RUN
+Scratch for a fan-out. Default \fI$XDG_RUNTIME_DIR/rig-$(id -u)\fR, and
+deliberately not under \fB$HOME\fR, so two boxes sharing a home cannot
+collide.
+.TP
+.B RIG_PAR
+Concurrent probes. Default 6.
+.TP
+.B RIG_TIMEOUT
+Per-box timeout in seconds. Default 12.
+.TP
+.B RIG_SSH_OPTS
+Appended to every ssh invocation, so a jump host can be added without the
+tool knowing one exists.
+.TP
+.B RIG_INCLUDE_UNOWNED
+Probe boxes marked \fBown=no\fR. They are still never written to.
+.TP
+.B RIG_ART
+Force art into a pipe.
+.TP
+.B RIG_NO_ART \fRor\fB NO_COLOR
+Suppress art, or colour.
+.SH EXIT STATUS
+0 when everything is fine or only transiently wrong: a lock held, a network
+failure, an unreachable box, a dirty tree with nothing pending, a gap found
+and closed.
+.PP
+1 when a human must act: an unregistered box, a box that is not yours, a
+diverged repo, an unfinished merge or rebase, a link conflict, an orphaned
+link, a missing declared mount, a timer that will not enable, an editor-stack
+gap, a theme finding from \fBdye\fR, a secrets identity, blob or copy that is
+missing, loose or stale, a filesystem under 2 GB free, a commit
+a hook refused, a push the remote rejected, or a stage that claimed success
+while the re-check disagreed.
+.PP
+Nothing else, so \fBrig sync\fR can carry an \fBOnFailure\fR hook without
+inventing a new contract.
+.SH FILES
+.TP
+.I bin/rig
+The tool, in the sc-fleet checkout.
+.TP
+.I lib/rig-probe.sh
+The read-only probe payload.
+.TP
+.I ~/.config/sc-fleet/config
+The fleet config (see CONFIGURATION).
+.TP
+.I ~/.config/rig/boxes.conf
+The roster. Site data.
+.TP
+.I ~/.config/age/dotfiles.key
+This box's identity for the sealed secrets. One per box, never copied
+between them; not the vault-backup key that lives beside it under another
+name.
+.TP
+.I ~/.local/state/rig/disk/
+Where \fB--disk\fR leaves each root's raw traversal (\fI.du.gz\fR) and
+report (\fI.md\fR). Latest run overwrites; the date is inside the report.
+.TP
+.I tests/test_rig.sh
+The test suite. Run: \fBbash tests/test_rig.sh\fR
+.SH EXAMPLES
+.nf
+.RS
+rig                    # is this box current
+rig status -a          # is the fleet current
+rig sync --dry-run     # what would it change
+rig push               # commit what is dirty here, push what is ahead
+rig push -m 'wt: fix'  # the same, with a message of your own
+rig doctor             # what is misconfigured here, one exit code
+rig doctor --disk      # the same, plus a du triage of every mount
+rig doctor --disk /tmp # one filesystem only
+rig boxes --lint       # is the roster safe to share
+.RE
+.fi
+.SH SEE ALSO
+.BR sc (1),
+.BR crew (1),
+.BR arm (1),
+.BR wt (1)

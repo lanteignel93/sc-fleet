@@ -1,0 +1,110 @@
+#compdef wt
+# zsh completion for wt.
+# Reached through the fpath entry ~/.zsh_functions (zshrc line 157), which
+# holds a symlink to this file. Hand-written; nothing generates it.
+#
+# The worktree list comes from `wt ls -a --porcelain`, the tab-separated
+# contract: proj repo slug branch path. No network, no forge call, so
+# completing a slug stays instant.
+
+_wt_worktrees() {
+  local -a items
+  local proj repo slug branch wtpath
+  while IFS=$'\t' read -r proj repo slug branch wtpath; do
+    [[ -n $slug ]] || continue
+    items+=( "${slug}:${proj}/${repo} ${branch}" )
+  done < <(command wt ls -a --porcelain 2>/dev/null)
+  (( $#items )) && _describe -t worktrees worktree items
+}
+
+# Topic branches already on the base remote — the candidates for a stacked PR.
+_wt_pushed_topics() {
+  local -a brs
+  brs=( ${(f)"$(git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin 2>/dev/null)"} )
+  brs=( ${brs:#HEAD} )
+  (( $#brs )) && _describe -t branches 'pushed branch' brs
+}
+
+_wt() {
+  local curcontext="$curcontext" state line ret=1
+  typeset -A opt_args
+
+  local -a cmds
+  cmds=(
+    'init:bootstrap or retrofit a project'
+    'new:create a topic worktree'
+    'ls:table of worktrees'
+    'path:print one worktree path'
+    'cd:cd to a worktree (needs the zsh function)'
+    'sync:rebase this topic onto the base default branch'
+    'pr:land a topic as a pull request'
+    'rm:remove a merged topic'
+    'doctor:check layout, conf and forge credentials'
+    'help:the manual, or one command'
+  )
+
+  _arguments -C '1: :->cmd' '*:: :->args' && ret=0
+
+  case $state in
+    cmd)
+      _describe -t commands 'wt command' cmds && ret=0
+      ;;
+    args)
+      case $words[1] in
+        cd|path)
+          _wt_worktrees && ret=0
+          ;;
+        rm)
+          _arguments \
+            '--force[discard dirty or unpushed work and delete an unmerged branch]' \
+            '*:: :_wt_worktrees' && ret=0
+          ;;
+        ls)
+          _arguments \
+            '(-a --all)'{-a,--all}'[every project under WT_ROOT, not just this one]' \
+            '--pr[ask the forge for the head PR state (network)]' \
+            '--porcelain[tab-separated, no header, no colour]' && ret=0
+          ;;
+        new)
+          _arguments \
+            '--prefix[override the conf branch prefix]:prefix:' \
+            '--track[adopt an existing remote branch]:remote branch:_wt_pushed_topics' \
+            '--from[branch off this ref instead of the base default]:ref:_wt_pushed_topics' \
+            '--repo[operate on this repo]:repo:' \
+            '1:slug:' && ret=0
+          ;;
+        pr)
+          _arguments \
+            '(-t --title)'{-t,--title}'[PR and squash-commit title]:title:' \
+            '-b[body file]:body file:_files' \
+            '--base[stack onto and target this pushed topic]:branch:_wt_pushed_topics' \
+            '--draft[open as a draft]' \
+            '--no-squash[keep every commit instead of squashing to one]' \
+            '--dry-run[show what would happen; no rebase, no push]' && ret=0
+          ;;
+        init)
+          _arguments \
+            '--migrate[retrofit an existing clone into the layout]' \
+            '--mine[only branches whose tip you authored]' \
+            '(-y --yes)'{-y,--yes}'[assume yes]' \
+            '--project[operate on this project slug]:project:' \
+            '--clone[clone this URL into src/<basename>/main]:url:' \
+            '--new[create a new repo with this name]:name:' \
+            '--remote[remote URL for --new]:url:' \
+            '--forge[forge for --new]:forge:(forgejo github)' \
+            '--org[owner or org for --new]:org:' \
+            '--repo[operate on this repo]:repo:' && ret=0
+          ;;
+        doctor)
+          _arguments '-a[every project under WT_ROOT]' && ret=0
+          ;;
+        help)
+          _describe -t commands 'wt command' cmds && ret=0
+          ;;
+      esac
+      ;;
+  esac
+  return ret
+}
+
+_wt "$@"

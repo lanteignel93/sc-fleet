@@ -1,0 +1,75 @@
+#compdef sc
+# zsh completion for sc, the spacecowboy fleet dispatcher.
+# Reached through the fpath entry ~/.zsh_functions; fleet.zsh autoloads and
+# compdefs it.
+#
+# Membership mirrors sc's own rule rather than a manifest that would drift:
+# a tool is a member when it carries the "# sc-fleet" marker. The marker is
+# read off the file FIRST, and only a confirmed member is then asked for its
+# identity via the hidden `__id` verb — the same order `sc ls` uses, so a
+# stray executable in the directory is never run to find out what it is.
+#
+# After the tool name, completion hands off to that tool's own completion
+# (`sc wt pr --<TAB>` behaves like `wt pr --<TAB>`).
+
+_sc_tools() {
+  local bin d f name tag real
+  local -a items seen
+  bin=${${:-$(whence -p sc)}:A:h}
+  [[ -d $bin ]] || return 1
+  # this directory first, then SC_BIN_EXTRA (default ~/.local/bin), one entry
+  # per real path — the same walk sc itself makes
+  for d in $bin ${=SC_BIN_EXTRA-$HOME/.local/bin}; do
+  [[ -d $d ]] || continue
+  for f in $d/*(N.x); do
+    name=${f:t}
+    [[ $name == sc ]] && continue
+    grep -qm1 '^# sc-fleet' $f 2>/dev/null || continue
+    real=${f:A}
+    (( ${seen[(Ie)$real]} )) && continue
+    seen+=( $real )
+    # field 2 of the tab-separated __id record: strip through the first
+    # tab, then keep everything up to the next one.
+    tag="$($f __id 2>/dev/null)"
+    tag="${tag#*$'\t'}"; tag="${tag%%$'\t'*}"
+    items+=( "${name}:${tag:-fleet tool}" )
+  done
+  done
+  (( $#items )) && _describe -t tools 'fleet tool' items
+}
+
+_sc() {
+  local curcontext="$curcontext" state line ret=1
+  typeset -A opt_args
+
+  local -a builtins
+  builtins=(
+    'ls:the roster'
+    'logo:the banner, for a README'
+    'help:logo, roster and usage'
+  )
+
+  _arguments -C '1: :->cmd' '*:: :->args' && ret=0
+
+  case $state in
+    cmd)
+      _describe -t commands 'sc command' builtins
+      _sc_tools
+      ret=0
+      ;;
+    args)
+      case $words[1] in
+        ls|logo|help) ;;
+        *)
+          # '*::' already rebased words/CURRENT onto the tool, so the line now
+          # reads as if the tool had been typed directly. _normal then finds
+          # that tool's own completion (the _sudo / _nice handoff idiom).
+          _normal && ret=0
+          ;;
+      esac
+      ;;
+  esac
+  return ret
+}
+
+_sc "$@"
